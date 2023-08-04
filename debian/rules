@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+
+export GOPATH=$(CURDIR)/_build
+
+%:
+	dh $@ --buildsystem=golang --builddirectory=_build
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/_build
+
+override_dh_auto_build:
+	make build
+
+override_dh_auto_test:
+
+override_dh_dwz:
+
+override_dh_auto_install:
+	install -p -m 0755 $(CURDIR)/bin/build/docker-buildx $(CURDIR)/debian/docker-buildx/usr/libexec/docker/cli-plugins
