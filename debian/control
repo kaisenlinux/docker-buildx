@@ -17,5 +17,4 @@ Architecture: amd64 i386 arm64
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
- golang-go (>= 1.20),
 Description: Docker CLI plugin for extended build capabilities with BuildKit

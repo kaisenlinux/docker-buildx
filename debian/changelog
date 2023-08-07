@@ -1,3 +1,9 @@
+docker-buildx (0.11.2-2kaisen) kaisen-packages; urgency=medium
+
+  * Remove golang-go as package dependancy
+
+ -- Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>  Mon, 07 Aug 2023 13:28:58 +0200
+
 docker-buildx (0.11.2-1kaisen) kaisen-packages; urgency=medium
 
   * Initial release
