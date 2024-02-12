@@ -1,3 +1,10 @@
+docker-buildx (0.12.1-1kaisen) kaisen-packages; urgency=medium
+
+  * Import the 0.12.1 release
+  * Update the quilt patch
+
+ -- Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>  Mon, 12 Feb 2024 23:01:17 +0200
+
 docker-buildx (0.11.2-2kaisen) kaisen-packages; urgency=medium
 
   * Remove golang-go as package dependancy

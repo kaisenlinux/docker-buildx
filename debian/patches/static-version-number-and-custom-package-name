@@ -1,8 +1,8 @@
 Author: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
 
---- docker-buildx-0.11.2.orig/hack/build
-+++ docker-buildx-0.11.2/hack/build
-@@ -3,13 +3,12 @@
+--- docker-buildx-0.12.1.orig/hack/build
++++ docker-buildx-0.12.1/hack/build
+@@ -3,14 +3,13 @@
  set -e
  
  : "${DESTDIR=./bin/build}"
@@ -10,18 +10,19 @@ Author: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
 -: "${VERSION=$(./hack/git-meta version)}"
 -: "${REVISION=$(./hack/git-meta revision)}"
 +: "${PACKAGE=docker-buildx}"
-+: "${VERSION=0.11.2}"
++: "${VERSION=0.12.1}"
  
  : "${CGO_ENABLED=0}"
 -: "${GO_PKG=github.com/docker/buildx}"
--: "${GO_LDFLAGS=-X ${GO_PKG}/version.Version=${VERSION} -X ${GO_PKG}/version.Revision=${REVISION} -X ${GO_PKG}/version.Package=${PACKAGE}}"
 +: "${GO_PKG=docker-buildx}"
+ : "${GO_EXTRA_FLAGS=}"
+-: "${GO_LDFLAGS=-X ${GO_PKG}/version.Version=${VERSION} -X ${GO_PKG}/version.Revision=${REVISION} -X ${GO_PKG}/version.Package=${PACKAGE}}"
 +: "${GO_LDFLAGS=-X ${GO_PKG}/version.Version=${VERSION}}"
  : "${GO_EXTRA_LDFLAGS=}"
  
  set -x
---- docker-buildx-0.11.2.orig/version/version.go
-+++ docker-buildx-0.11.2/version/version.go
+--- docker-buildx-0.12.1.orig/version/version.go
++++ docker-buildx-0.12.1/version/version.go
 @@ -2,10 +2,10 @@ package version
  
  var (
@@ -31,7 +32,7 @@ Author: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
  
  	// Version holds the complete version number. Filled in at linking time.
 -	Version = "v0.0.0+unknown"
-+	Version = "0.11.2"
++	Version = "0.12.1"
  
  	// Revision is filled with the VCS (e.g. git) revision being used to build
  	// the program at linking time.
