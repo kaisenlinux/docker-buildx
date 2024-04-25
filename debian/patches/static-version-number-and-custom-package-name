@@ -1,7 +1,7 @@
 Author: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
 
---- docker-buildx-0.12.1.orig/hack/build
-+++ docker-buildx-0.12.1/hack/build
+--- docker-buildx-0.14.0.orig/hack/build
++++ docker-buildx-0.14.0/hack/build
 @@ -3,14 +3,13 @@
  set -e
  
@@ -10,7 +10,7 @@ Author: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
 -: "${VERSION=$(./hack/git-meta version)}"
 -: "${REVISION=$(./hack/git-meta revision)}"
 +: "${PACKAGE=docker-buildx}"
-+: "${VERSION=0.12.1}"
++: "${VERSION=0.14.0}"
  
  : "${CGO_ENABLED=0}"
 -: "${GO_PKG=github.com/docker/buildx}"
@@ -32,7 +32,7 @@ Author: Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>
  
  	// Version holds the complete version number. Filled in at linking time.
 -	Version = "v0.0.0+unknown"
-+	Version = "0.12.1"
++	Version = "0.14.0"
  
  	// Revision is filled with the VCS (e.g. git) revision being used to build
  	// the program at linking time.

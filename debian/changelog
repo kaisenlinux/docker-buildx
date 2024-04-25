@@ -1,3 +1,10 @@
+docker-buildx (0.14.0-1kaisen) kaisen-packages; urgency=medium
+
+  * Import the 0.14.0 release
+  * Update the quilt patch
+
+ -- Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>  Thu, 25 Apr 2024 19:34:09 +0200
+
 docker-buildx (0.12.1-1kaisen) kaisen-packages; urgency=medium
 
   * Import the 0.12.1 release
