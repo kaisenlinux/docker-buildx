@@ -36,13 +36,7 @@ func RunPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager
 	PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		var err error
 		persistentPreRunOnce.Do(func() {
-			cmdContext := cmd.Context()
-			// TODO: revisit and make sure this check makes sense
-			// see: https://github.com/docker/cli/pull/4599#discussion_r1422487271
-			if cmdContext == nil {
-				cmdContext = context.TODO()
-			}
-			ctx, cancel := context.WithCancel(cmdContext)
+			ctx, cancel := context.WithCancel(cmd.Context())
 			cmd.SetContext(ctx)
 			// Set up the context to cancel based on signalling via CLI socket.
 			socket.ConnectAndWait(cancel)
@@ -51,7 +45,26 @@ func RunPlugin(dockerCli *command.DockerCli, plugin *cobra.Command, meta manager
 			if os.Getenv("DOCKER_CLI_PLUGIN_USE_DIAL_STDIO") != "" {
 				opts = append(opts, withPluginClientConn(plugin.Name()))
 			}
+			opts = append(opts, command.WithEnableGlobalMeterProvider(), command.WithEnableGlobalTracerProvider())
 			err = tcmd.Initialize(opts...)
+			ogRunE := cmd.RunE
+			if ogRunE == nil {
+				ogRun := cmd.Run
+				// necessary because error will always be nil here
+				// see: https://github.com/golangci/golangci-lint/issues/1379
+				//nolint:unparam
+				ogRunE = func(cmd *cobra.Command, args []string) error {
+					ogRun(cmd, args)
+					return nil
+				}
+				cmd.Run = nil
+			}
+			cmd.RunE = func(cmd *cobra.Command, args []string) error {
+				stopInstrumentation := dockerCli.StartInstrumentation(cmd)
+				err := ogRunE(cmd, args)
+				stopInstrumentation(err)
+				return err
+			}
 		})
 		return err
 	}

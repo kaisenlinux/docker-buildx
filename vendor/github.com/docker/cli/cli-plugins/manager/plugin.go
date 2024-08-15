@@ -1,7 +1,9 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -104,16 +106,16 @@ func newPlugin(c Candidate, cmds []*cobra.Command) (Plugin, error) {
 
 // RunHook executes the plugin's hooks command
 // and returns its unprocessed output.
-func (p *Plugin) RunHook(cmdName string, flags map[string]string) ([]byte, error) {
-	hDataBytes, err := json.Marshal(HookPluginData{
-		RootCmd: cmdName,
-		Flags:   flags,
-	})
+func (p *Plugin) RunHook(ctx context.Context, hookData HookPluginData) ([]byte, error) {
+	hDataBytes, err := json.Marshal(hookData)
 	if err != nil {
 		return nil, wrapAsPluginError(err, "failed to marshall hook data")
 	}
 
-	hookCmdOutput, err := exec.Command(p.Path, p.Name, HookSubcommandName, string(hDataBytes)).Output()
+	pCmd := exec.CommandContext(ctx, p.Path, p.Name, HookSubcommandName, string(hDataBytes))
+	pCmd.Env = os.Environ()
+	pCmd.Env = append(pCmd.Env, ReexecEnvvar+"="+os.Args[0])
+	hookCmdOutput, err := pCmd.Output()
 	if err != nil {
 		return nil, wrapAsPluginError(err, "failed to execute plugin hook subcommand")
 	}

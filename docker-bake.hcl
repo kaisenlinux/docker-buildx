@@ -7,8 +7,11 @@ variable "DOCS_FORMATS" {
 variable "DESTDIR" {
   default = "./bin"
 }
-variable "GOLANGCI_LINT_MULTIPLATFORM" {
+variable "TEST_COVERAGE" {
   default = null
+}
+variable "GOLANGCI_LINT_MULTIPLATFORM" {
+  default = ""
 }
 
 # Special target: https://github.com/docker/metadata-action#bake-definition
@@ -28,14 +31,14 @@ group "default" {
 }
 
 group "validate" {
-  targets = ["lint", "validate-vendor", "validate-docs"]
+  targets = ["lint", "lint-gopls", "validate-vendor", "validate-docs"]
 }
 
 target "lint" {
   inherits = ["_common"]
   dockerfile = "./hack/dockerfiles/lint.Dockerfile"
   output = ["type=cacheonly"]
-  platforms = GOLANGCI_LINT_MULTIPLATFORM != null ? [
+  platforms = GOLANGCI_LINT_MULTIPLATFORM != "" ? [
     "darwin/amd64",
     "darwin/arm64",
     "linux/amd64",
@@ -46,6 +49,11 @@ target "lint" {
     "windows/amd64",
     "windows/arm64"
   ] : []
+}
+
+target "lint-gopls" {
+  inherits = ["lint"]
+  target = "gopls-analyze"
 }
 
 target "validate-vendor" {
@@ -187,6 +195,7 @@ variable "TEST_BUILDKIT_TAG" {
 target "integration-test-base" {
   inherits = ["_common"]
   args = {
+    GO_EXTRA_FLAGS = TEST_COVERAGE == "1" ? "-cover" : null
     HTTP_PROXY = HTTP_PROXY
     HTTPS_PROXY = HTTPS_PROXY
     NO_PROXY = NO_PROXY

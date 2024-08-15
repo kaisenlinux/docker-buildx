@@ -5,12 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,7 +37,6 @@ import (
 	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/util/tracing"
-	"github.com/docker/cli-docs-tool/annotation"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	dockeropts "github.com/docker/cli/opts"
@@ -59,6 +56,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"github.com/tonistiigi/go-csvvalue"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
@@ -122,27 +120,26 @@ func (o *buildOptions) toControllerOptions() (*controllerapi.BuildOptions, error
 	}
 
 	opts := controllerapi.BuildOptions{
-		Allow:                  o.allow,
-		Annotations:            o.annotations,
-		BuildArgs:              buildArgs,
-		CgroupParent:           o.cgroupParent,
-		ContextPath:            o.contextPath,
-		DockerfileName:         o.dockerfileName,
-		ExtraHosts:             o.extraHosts,
-		Labels:                 labels,
-		NetworkMode:            o.networkMode,
-		NoCacheFilter:          o.noCacheFilter,
-		Platforms:              o.platforms,
-		ShmSize:                int64(o.shmSize),
-		Tags:                   o.tags,
-		Target:                 o.target,
-		Ulimits:                dockerUlimitToControllerUlimit(o.ulimits),
-		Builder:                o.builder,
-		NoCache:                o.noCache,
-		Pull:                   o.pull,
-		ExportPush:             o.exportPush,
-		ExportLoad:             o.exportLoad,
-		WithProvenanceResponse: len(o.metadataFile) > 0,
+		Allow:          o.allow,
+		Annotations:    o.annotations,
+		BuildArgs:      buildArgs,
+		CgroupParent:   o.cgroupParent,
+		ContextPath:    o.contextPath,
+		DockerfileName: o.dockerfileName,
+		ExtraHosts:     o.extraHosts,
+		Labels:         labels,
+		NetworkMode:    o.networkMode,
+		NoCacheFilter:  o.noCacheFilter,
+		Platforms:      o.platforms,
+		ShmSize:        int64(o.shmSize),
+		Tags:           o.tags,
+		Target:         o.target,
+		Ulimits:        dockerUlimitToControllerUlimit(o.ulimits),
+		Builder:        o.builder,
+		NoCache:        o.noCache,
+		Pull:           o.pull,
+		ExportPush:     o.exportPush,
+		ExportLoad:     o.exportLoad,
 	}
 
 	// TODO: extract env var parsing to a method easily usable by library consumers
@@ -207,6 +204,12 @@ func (o *buildOptions) toControllerOptions() (*controllerapi.BuildOptions, error
 		return nil, err
 	}
 
+	prm := confutil.MetadataProvenance()
+	if opts.PrintFunc != nil || len(o.metadataFile) == 0 {
+		prm = confutil.MetadataProvenanceModeDisabled
+	}
+	opts.ProvenanceResponseMode = string(prm)
+
 	return &opts, nil
 }
 
@@ -268,8 +271,7 @@ func (o *buildOptionsHash) String() string {
 }
 
 func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) (err error) {
-	mp := dockerCli.MeterProvider(ctx)
-	defer metricutil.Shutdown(ctx, mp)
+	mp := dockerCli.MeterProvider()
 
 	ctx, end, err := tracing.TraceCurrentCommand(ctx, "build")
 	if err != nil {
@@ -340,7 +342,7 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	if confutil.IsExperimental() {
 		resp, retErr = runControllerBuild(ctx, dockerCli, opts, options, printer)
 	} else {
-		resp, retErr = runBasicBuild(ctx, dockerCli, opts, options, printer)
+		resp, retErr = runBasicBuild(ctx, dockerCli, opts, printer)
 	}
 
 	if err := printer.Wait(); retErr == nil {
@@ -365,13 +367,18 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 			return errors.Wrap(err, "writing image ID file")
 		}
 	}
-	if options.metadataFile != "" {
-		if err := writeMetadataFile(options.metadataFile, decodeExporterResponse(resp.ExporterResponse)); err != nil {
-			return err
-		}
-	}
 	if opts.PrintFunc != nil {
-		if err := printResult(opts.PrintFunc, resp.ExporterResponse); err != nil {
+		if exitcode, err := printResult(dockerCli.Out(), opts.PrintFunc, resp.ExporterResponse); err != nil {
+			return err
+		} else if exitcode != 0 {
+			os.Exit(exitcode)
+		}
+	} else if options.metadataFile != "" {
+		dt := decodeExporterResponse(resp.ExporterResponse)
+		if warnings := printer.Warnings(); len(warnings) > 0 && confutil.MetadataWarningsEnabled() {
+			dt["buildx.build.warnings"] = warnings
+		}
+		if err := writeMetadataFile(options.metadataFile, dt); err != nil {
 			return err
 		}
 	}
@@ -387,7 +394,7 @@ func getImageID(resp map[string]string) string {
 	return dgst
 }
 
-func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, options buildOptions, printer *progress.Printer) (*client.SolveResponse, error) {
+func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, printer *progress.Printer) (*client.SolveResponse, error) {
 	resp, res, err := cbuild.RunBuild(ctx, dockerCli, *opts, dockerCli.In(), printer, false)
 	if res != nil {
 		res.Done()
@@ -523,9 +530,12 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 
 	cmd := &cobra.Command{
 		Use:     "build [OPTIONS] PATH | URL | -",
-		Aliases: []string{"b"},
 		Short:   "Start a build",
 		Args:    cli.ExactArgs(1),
+		Aliases: []string{"b"},
+		Annotations: map[string]string{
+			"aliases": "docker build, docker builder build, docker image build, docker buildx b",
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options.contextPath = args[0]
 			options.builder = rootOpts.builder
@@ -564,7 +574,6 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 	flags := cmd.Flags()
 
 	flags.StringSliceVar(&options.extraHosts, "add-host", []string{}, `Add a custom host-to-IP mapping (format: "host:ip")`)
-	flags.SetAnnotation("add-host", annotation.ExternalURL, []string{"https://docs.docker.com/reference/cli/docker/image/build/#add-host"})
 
 	flags.StringSliceVar(&options.allow, "allow", []string{}, `Allow extra privileged entitlement (e.g., "network.host", "security.insecure")`)
 
@@ -577,12 +586,10 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 	flags.StringArrayVar(&options.cacheTo, "cache-to", []string{}, `Cache export destinations (e.g., "user/app:cache", "type=local,dest=path/to/dir")`)
 
 	flags.StringVar(&options.cgroupParent, "cgroup-parent", "", `Set the parent cgroup for the "RUN" instructions during build`)
-	flags.SetAnnotation("cgroup-parent", annotation.ExternalURL, []string{"https://docs.docker.com/reference/cli/docker/image/build/#cgroup-parent"})
 
 	flags.StringArrayVar(&options.contexts, "build-context", []string{}, "Additional build contexts (e.g., name=path)")
 
 	flags.StringVarP(&options.dockerfileName, "file", "f", "", `Name of the Dockerfile (default: "PATH/Dockerfile")`)
-	flags.SetAnnotation("file", annotation.ExternalURL, []string{"https://docs.docker.com/reference/cli/docker/image/build/#file"})
 
 	flags.StringVar(&options.imageIDFile, "iidfile", "", "Write the image ID to a file")
 
@@ -598,11 +605,6 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 
 	flags.StringArrayVar(&options.platforms, "platform", platformsDefault, "Set target platform for build")
 
-	if confutil.IsExperimental() {
-		flags.StringVar(&options.printFunc, "print", "", "Print result of information request (e.g., outline, targets)")
-		cobrautil.MarkFlagsExperimental(flags, "print")
-	}
-
 	flags.BoolVar(&options.exportPush, "push", false, `Shorthand for "--output=type=registry"`)
 
 	flags.BoolVarP(&options.quiet, "quiet", "q", false, "Suppress the build output and print image ID on success")
@@ -614,10 +616,8 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 	flags.StringArrayVar(&options.ssh, "ssh", []string{}, `SSH agent socket or keys to expose to the build (format: "default|<id>[=<socket>|<key>[,<key>]]")`)
 
 	flags.StringArrayVarP(&options.tags, "tag", "t", []string{}, `Name and optionally a tag (format: "name:tag")`)
-	flags.SetAnnotation("tag", annotation.ExternalURL, []string{"https://docs.docker.com/reference/cli/docker/image/build/#tag"})
 
 	flags.StringVar(&options.target, "target", "", "Set the target build stage to build")
-	flags.SetAnnotation("target", annotation.ExternalURL, []string{"https://docs.docker.com/reference/cli/docker/image/build/#target"})
 
 	options.ulimits = dockeropts.NewUlimitOpt(nil)
 	flags.Var(options.ulimits, "ulimit", "Ulimit options")
@@ -634,11 +634,19 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 		cobrautil.MarkFlagsExperimental(flags, "root", "detach", "server-config")
 	}
 
+	flags.StringVar(&options.printFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
+	flags.VarPF(callAlias(&options.printFunc, "check"), "check", "", `Shorthand for "--call=check"`)
+	flags.Lookup("check").NoOptDefVal = "true"
+
 	// hidden flags
 	var ignore string
 	var ignoreSlice []string
 	var ignoreBool bool
 	var ignoreInt int64
+
+	flags.StringVar(&options.printFunc, "print", "", "Print result of information request (e.g., outline, targets)")
+	cobrautil.MarkFlagsExperimental(flags, "print")
+	flags.MarkHidden("print")
 
 	flags.BoolVar(&ignoreBool, "compress", false, "Compress the build context using gzip")
 	flags.MarkHidden("compress")
@@ -697,7 +705,7 @@ type commonFlags struct {
 
 func commonBuildFlags(options *commonFlags, flags *pflag.FlagSet) {
 	options.noCache = flags.Bool("no-cache", false, "Do not use cache when building the image")
-	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "plain", "tty"). Use plain to show container output`)
+	flags.StringVar(&options.progress, "progress", "auto", `Set type of progress output ("auto", "plain", "tty", "rawjson"). Use plain to show container output`)
 	options.pull = flags.Bool("pull", false, "Always attempt to pull all referenced images")
 	flags.StringVar(&options.metadataFile, "metadata-file", "", "Write build result metadata to a file")
 }
@@ -827,7 +835,7 @@ func printWarnings(w io.Writer, warnings []client.VertexWarning, mode progressui
 		fmt.Fprintf(sb, "%d warnings found", len(warnings))
 	}
 	if logrus.GetLevel() < logrus.DebugLevel {
-		fmt.Fprintf(sb, " (use --debug to expand)")
+		fmt.Fprintf(sb, " (use docker --debug to expand)")
 	}
 	fmt.Fprintf(sb, ":\n")
 	fmt.Fprint(w, aec.Apply(sb.String(), aec.YellowF))
@@ -855,47 +863,78 @@ func printWarnings(w io.Writer, warnings []client.VertexWarning, mode progressui
 	}
 }
 
-func printResult(f *controllerapi.PrintFunc, res map[string]string) error {
+func printResult(w io.Writer, f *controllerapi.PrintFunc, res map[string]string) (int, error) {
 	switch f.Name {
 	case "outline":
-		return printValue(outline.PrintOutline, outline.SubrequestsOutlineDefinition.Version, f.Format, res)
+		return 0, printValue(w, outline.PrintOutline, outline.SubrequestsOutlineDefinition.Version, f.Format, res)
 	case "targets":
-		return printValue(targets.PrintTargets, targets.SubrequestsTargetsDefinition.Version, f.Format, res)
+		return 0, printValue(w, targets.PrintTargets, targets.SubrequestsTargetsDefinition.Version, f.Format, res)
 	case "subrequests.describe":
-		return printValue(subrequests.PrintDescribe, subrequests.SubrequestsDescribeDefinition.Version, f.Format, res)
+		return 0, printValue(w, subrequests.PrintDescribe, subrequests.SubrequestsDescribeDefinition.Version, f.Format, res)
 	case "lint":
-		return printValue(lint.PrintLintViolations, lint.SubrequestLintDefinition.Version, f.Format, res)
+		err := printValue(w, lint.PrintLintViolations, lint.SubrequestLintDefinition.Version, f.Format, res)
+		if err != nil {
+			return 0, err
+		}
+
+		lintResults := lint.LintResults{}
+		if result, ok := res["result.json"]; ok {
+			if err := json.Unmarshal([]byte(result), &lintResults); err != nil {
+				return 0, err
+			}
+		}
+		if lintResults.Error != nil {
+			// Print the error message and the source
+			// Normally, we would use `errdefs.WithSource` to attach the source to the
+			// error and let the error be printed by the handling that's already in place,
+			// but here we want to print the error in a way that's consistent with how
+			// the lint warnings are printed via the `lint.PrintLintViolations` function,
+			// which differs from the default error printing.
+			if f.Format != "json" && len(lintResults.Warnings) > 0 {
+				fmt.Fprintln(w)
+			}
+			lintBuf := bytes.NewBuffer([]byte(lintResults.Error.Message + "\n"))
+			sourceInfo := lintResults.Sources[lintResults.Error.Location.SourceIndex]
+			source := errdefs.Source{
+				Info:   sourceInfo,
+				Ranges: lintResults.Error.Location.Ranges,
+			}
+			source.Print(lintBuf)
+			return 0, errors.New(lintBuf.String())
+		} else if len(lintResults.Warnings) == 0 && f.Format != "json" {
+			fmt.Fprintln(w, "Check complete, no warnings found.")
+		}
 	default:
 		if dt, ok := res["result.json"]; ok && f.Format == "json" {
-			fmt.Println(dt)
+			fmt.Fprintln(w, dt)
 		} else if dt, ok := res["result.txt"]; ok {
-			fmt.Print(dt)
+			fmt.Fprint(w, dt)
 		} else {
-			log.Printf("%s %+v", f, res)
+			fmt.Fprintf(w, "%s %+v\n", f, res)
 		}
 	}
 	if v, ok := res["result.statuscode"]; !f.IgnoreStatus && ok {
 		if n, err := strconv.Atoi(v); err == nil && n != 0 {
-			os.Exit(n)
+			return n, nil
 		}
 	}
-	return nil
+	return 0, nil
 }
 
 type printFunc func([]byte, io.Writer) error
 
-func printValue(printer printFunc, version string, format string, res map[string]string) error {
+func printValue(w io.Writer, printer printFunc, version string, format string, res map[string]string) error {
 	if format == "json" {
-		fmt.Fprintln(os.Stdout, res["result.json"])
+		fmt.Fprintln(w, res["result.json"])
 		return nil
 	}
 
 	if res["version"] != "" && versions.LessThan(version, res["version"]) && res["result.txt"] != "" {
 		// structure is too new and we don't know how to print it
-		fmt.Fprint(os.Stdout, res["result.txt"])
+		fmt.Fprint(w, res["result.txt"])
 		return nil
 	}
-	return printer([]byte(res["result.json"]), os.Stdout)
+	return printer([]byte(res["result.json"]), w)
 }
 
 type invokeConfig struct {
@@ -945,9 +984,9 @@ func (cfg *invokeConfig) parseInvokeConfig(invoke, on string) error {
 		return nil
 	}
 
-	csvReader := csv.NewReader(strings.NewReader(invoke))
-	csvReader.LazyQuotes = true
-	fields, err := csvReader.Read()
+	csvParser := csvvalue.NewParser()
+	csvParser.LazyQuotes = true
+	fields, err := csvParser.Fields(invoke, nil)
 	if err != nil {
 		return err
 	}
@@ -1001,6 +1040,20 @@ func maybeJSONArray(v string) []string {
 		return list
 	}
 	return []string{v}
+}
+
+func callAlias(target *string, value string) cobrautil.BoolFuncValue {
+	return func(s string) error {
+		v, err := strconv.ParseBool(s)
+		if err != nil {
+			return err
+		}
+
+		if v {
+			*target = value
+		}
+		return nil
+	}
 }
 
 // timeBuildCommand will start a timer for timing the build command. It records the time when the returned

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/compose-spec/compose-go/v2/consts"
 	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/loader"
 	composetypes "github.com/compose-spec/compose-go/v2/types"
@@ -39,7 +41,11 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 		ConfigFiles: cfgs,
 		Environment: envs,
 	}, func(options *loader.Options) {
-		options.SetProjectName("bake", false)
+		projectName := "bake"
+		if v, ok := envs[consts.ComposeProjectName]; ok && v != "" {
+			projectName = v
+		}
+		options.SetProjectName(projectName, false)
 		options.SkipNormalization = true
 		options.Profiles = []string{"*"}
 	})
@@ -107,6 +113,13 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 				}
 			}
 
+			var ssh []string
+			for _, bkey := range s.Build.SSH {
+				sshkey := composeToBuildkitSSH(bkey)
+				ssh = append(ssh, sshkey)
+			}
+			sort.Strings(ssh)
+
 			var secrets []string
 			for _, bs := range s.Build.Secrets {
 				secret, err := composeToBuildkitSecret(bs, cfg.Secrets[bs.Source])
@@ -142,6 +155,7 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 				CacheFrom:   s.Build.CacheFrom,
 				CacheTo:     s.Build.CacheTo,
 				NetworkMode: &s.Build.Network,
+				SSH:         ssh,
 				Secrets:     secrets,
 				ShmSize:     shmSize,
 				Ulimits:     ulimits,
@@ -275,7 +289,7 @@ type xbake struct {
 	NoCacheFilter stringArray `yaml:"no-cache-filter,omitempty"`
 	Contexts      stringMap   `yaml:"contexts,omitempty"`
 	// don't forget to update documentation if you add a new field:
-	// docs/manuals/bake/compose-file.md#extension-field-with-x-bake
+	// https://github.com/docker/docs/blob/main/content/build/bake/compose-file.md#extension-field-with-x-bake
 }
 
 type stringMap map[string]string
@@ -325,6 +339,7 @@ func (t *Target) composeExtTarget(exts map[string]interface{}) error {
 	}
 	if len(xb.SSH) > 0 {
 		t.SSH = dedupSlice(append(t.SSH, xb.SSH...))
+		sort.Strings(t.SSH)
 	}
 	if len(xb.Platforms) > 0 {
 		t.Platforms = dedupSlice(append(t.Platforms, xb.Platforms...))
@@ -367,4 +382,18 @@ func composeToBuildkitSecret(inp composetypes.ServiceSecretConfig, psecret compo
 	}
 
 	return strings.Join(bkattrs, ","), nil
+}
+
+// composeToBuildkitSSH converts secret from compose format to buildkit's
+// csv format.
+func composeToBuildkitSSH(sshKey composetypes.SSHKey) string {
+	var bkattrs []string
+
+	bkattrs = append(bkattrs, sshKey.ID)
+
+	if sshKey.Path != "" {
+		bkattrs = append(bkattrs, sshKey.Path)
+	}
+
+	return strings.Join(bkattrs, "=")
 }

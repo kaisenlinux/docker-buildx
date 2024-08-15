@@ -1,3 +1,13 @@
+docker-buildx (0.16.2-1kaisen) kaisen-packages; urgency=medium
+
+  * Import the 0.16.2 release
+  * Update the quilt patch
+  * Bump the Standards-Version
+  * Bump the golang-go version required to build
+  * Remove the i386 arch
+
+ -- Kevin Chevreuil - Kaisen <kaisen@kaisenlinux.org>  Thu, 15 Aug 2024 15:02:32 +0200
+
 docker-buildx (0.14.0-1kaisen) kaisen-packages; urgency=medium
 
   * Import the 0.14.0 release

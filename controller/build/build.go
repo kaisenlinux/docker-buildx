@@ -21,7 +21,7 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/config"
 	dockeropts "github.com/docker/cli/opts"
-	"github.com/docker/go-units"
+	"github.com/docker/docker/api/types/container"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/util/grpcerrors"
@@ -67,7 +67,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 		Target:                 in.Target,
 		Ulimits:                controllerUlimitOpt2DockerUlimit(in.Ulimits),
 		GroupRef:               in.GroupRef,
-		WithProvenanceResponse: in.WithProvenanceResponse,
+		ProvenanceResponseMode: confutil.ParseMetadataProvenance(in.ProvenanceResponseMode),
 	}
 
 	platforms, err := platformutil.Parse(in.Platforms)
@@ -136,8 +136,9 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 
 	annotations, err := buildflags.ParseAnnotations(in.Annotations)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Wrap(err, "parse annotations")
 	}
+
 	for _, o := range outputs {
 		for k, v := range annotations {
 			o.Attrs[k.String()] = v
@@ -189,7 +190,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 		return nil, nil, err
 	}
 
-	resp, res, err := buildTargets(ctx, dockerCli, b.NodeGroup, nodes, map[string]build.Options{defaultTargetName: opts}, progress, generateResult)
+	resp, res, err := buildTargets(ctx, dockerCli, nodes, map[string]build.Options{defaultTargetName: opts}, progress, generateResult)
 	err = wrapBuildError(err, false)
 	if err != nil {
 		// NOTE: buildTargets can return *build.ResultHandle even on error.
@@ -203,7 +204,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 // NOTE: When an error happens during the build and this function acquires the debuggable *build.ResultHandle,
 // this function returns it in addition to the error (i.e. it does "return nil, res, err"). The caller can
 // inspect the result and debug the cause of that error.
-func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGroup, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
+func buildTargets(ctx context.Context, dockerCli command.Cli, nodes []builder.Node, opts map[string]build.Options, progress progress.Writer, generateResult bool) (*client.SolveResponse, *build.ResultHandle, error) {
 	var res *build.ResultHandle
 	var resp map[string]*client.SolveResponse
 	var err error
@@ -270,9 +271,9 @@ func controllerUlimitOpt2DockerUlimit(u *controllerapi.UlimitOpt) *dockeropts.Ul
 	if u == nil {
 		return nil
 	}
-	values := make(map[string]*units.Ulimit)
+	values := make(map[string]*container.Ulimit)
 	for k, v := range u.Values {
-		values[k] = &units.Ulimit{
+		values[k] = &container.Ulimit{
 			Name: v.Name,
 			Hard: v.Hard,
 			Soft: v.Soft,
