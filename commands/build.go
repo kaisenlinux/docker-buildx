@@ -49,6 +49,7 @@ import (
 	"github.com/moby/buildkit/frontend/subrequests/outline"
 	"github.com/moby/buildkit/frontend/subrequests/targets"
 	"github.com/moby/buildkit/solver/errdefs"
+	solverpb "github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/morikuni/aec"
@@ -60,6 +61,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
 )
 
 type buildOptions struct {
@@ -79,7 +81,7 @@ type buildOptions struct {
 	noCacheFilter  []string
 	outputs        []string
 	platforms      []string
-	printFunc      string
+	callFunc       string
 	secrets        []string
 	shmSize        dockeropts.MemBytes
 	ssh            []string
@@ -199,13 +201,13 @@ func (o *buildOptions) toControllerOptions() (*controllerapi.BuildOptions, error
 		return nil, err
 	}
 
-	opts.PrintFunc, err = buildflags.ParsePrintFunc(o.printFunc)
+	opts.CallFunc, err = buildflags.ParseCallFunc(o.callFunc)
 	if err != nil {
 		return nil, err
 	}
 
 	prm := confutil.MetadataProvenance()
-	if opts.PrintFunc != nil || len(o.metadataFile) == 0 {
+	if opts.CallFunc != nil || len(o.metadataFile) == 0 {
 		prm = confutil.MetadataProvenanceModeDisabled
 	}
 	opts.ProvenanceResponseMode = string(prm)
@@ -224,15 +226,22 @@ func (o *buildOptions) toDisplayMode() (progressui.DisplayMode, error) {
 	return progress, nil
 }
 
-func buildMetricAttributes(dockerCli command.Cli, b *builder.Builder, options *buildOptions) attribute.Set {
+const (
+	commandNameAttribute = attribute.Key("command.name")
+	commandOptionsHash   = attribute.Key("command.options.hash")
+	driverNameAttribute  = attribute.Key("driver.name")
+	driverTypeAttribute  = attribute.Key("driver.type")
+)
+
+func buildMetricAttributes(dockerCli command.Cli, driverType string, options *buildOptions) attribute.Set {
 	return attribute.NewSet(
-		attribute.String("command.name", "build"),
-		attribute.Stringer("command.options.hash", &buildOptionsHash{
+		commandNameAttribute.String("build"),
+		attribute.Stringer(string(commandOptionsHash), &buildOptionsHash{
 			buildOptions: options,
-			configDir:    confutil.ConfigDir(dockerCli),
+			cfg:          confutil.NewConfig(dockerCli),
 		}),
-		attribute.String("driver.name", options.builder),
-		attribute.String("driver.type", b.Driver),
+		driverNameAttribute.String(options.builder),
+		driverTypeAttribute.String(driverType),
 	)
 }
 
@@ -241,7 +250,7 @@ func buildMetricAttributes(dockerCli command.Cli, b *builder.Builder, options *b
 // the fmt.Stringer interface.
 type buildOptionsHash struct {
 	*buildOptions
-	configDir  string
+	cfg        *confutil.Config
 	result     string
 	resultOnce sync.Once
 }
@@ -258,7 +267,7 @@ func (o *buildOptionsHash) String() string {
 		if contextPath != "-" && osutil.IsLocalDir(contextPath) {
 			contextPath = osutil.ToAbs(contextPath)
 		}
-		salt := confutil.TryNodeIdentifier(o.configDir)
+		salt := o.cfg.TryNodeIdentifier()
 
 		h := sha256.New()
 		for _, s := range []string{target, contextPath, dockerfile, salt} {
@@ -308,12 +317,13 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	if err != nil {
 		return err
 	}
+	driverType := b.Driver
 
 	var term bool
 	if _, err := console.ConsoleFromFile(os.Stderr); err == nil {
 		term = true
 	}
-	attributes := buildMetricAttributes(dockerCli, b, &options)
+	attributes := buildMetricAttributes(dockerCli, driverType, &options)
 
 	ctx2, cancel := context.WithCancel(context.TODO())
 	defer cancel()
@@ -338,11 +348,12 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 
 	done := timeBuildCommand(mp, attributes)
 	var resp *client.SolveResponse
+	var inputs *build.Inputs
 	var retErr error
 	if confutil.IsExperimental() {
-		resp, retErr = runControllerBuild(ctx, dockerCli, opts, options, printer)
+		resp, inputs, retErr = runControllerBuild(ctx, dockerCli, opts, options, printer)
 	} else {
-		resp, retErr = runBasicBuild(ctx, dockerCli, opts, printer)
+		resp, inputs, retErr = runBasicBuild(ctx, dockerCli, opts, printer)
 	}
 
 	if err := printer.Wait(); retErr == nil {
@@ -367,19 +378,22 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 			return errors.Wrap(err, "writing image ID file")
 		}
 	}
-	if opts.PrintFunc != nil {
-		if exitcode, err := printResult(dockerCli.Out(), opts.PrintFunc, resp.ExporterResponse); err != nil {
-			return err
-		} else if exitcode != 0 {
-			os.Exit(exitcode)
-		}
-	} else if options.metadataFile != "" {
+	if options.metadataFile != "" {
 		dt := decodeExporterResponse(resp.ExporterResponse)
-		if warnings := printer.Warnings(); len(warnings) > 0 && confutil.MetadataWarningsEnabled() {
-			dt["buildx.build.warnings"] = warnings
+		if opts.CallFunc == nil {
+			if warnings := printer.Warnings(); len(warnings) > 0 && confutil.MetadataWarningsEnabled() {
+				dt["buildx.build.warnings"] = warnings
+			}
 		}
 		if err := writeMetadataFile(options.metadataFile, dt); err != nil {
 			return err
+		}
+	}
+	if opts.CallFunc != nil {
+		if exitcode, err := printResult(dockerCli.Out(), opts.CallFunc, resp.ExporterResponse, options.target, inputs); err != nil {
+			return err
+		} else if exitcode != 0 {
+			os.Exit(exitcode)
 		}
 	}
 	return nil
@@ -394,22 +408,22 @@ func getImageID(resp map[string]string) string {
 	return dgst
 }
 
-func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, printer *progress.Printer) (*client.SolveResponse, error) {
-	resp, res, err := cbuild.RunBuild(ctx, dockerCli, *opts, dockerCli.In(), printer, false)
+func runBasicBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
+	resp, res, dfmap, err := cbuild.RunBuild(ctx, dockerCli, opts, dockerCli.In(), printer, false)
 	if res != nil {
 		res.Done()
 	}
-	return resp, err
+	return resp, dfmap, err
 }
 
-func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, options buildOptions, printer *progress.Printer) (*client.SolveResponse, error) {
+func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *controllerapi.BuildOptions, options buildOptions, printer *progress.Printer) (*client.SolveResponse, *build.Inputs, error) {
 	if options.invokeConfig != nil && (options.dockerfileName == "-" || options.contextPath == "-") {
 		// stdin must be usable for monitor
-		return nil, errors.Errorf("Dockerfile or context from stdin is not supported with invoke")
+		return nil, nil, errors.Errorf("Dockerfile or context from stdin is not supported with invoke")
 	}
 	c, err := controller.NewController(ctx, options.ControlOptions, dockerCli, printer)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() {
 		if err := c.Close(); err != nil {
@@ -421,12 +435,13 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 	// so we need to resolve paths to abosolute ones in the client.
 	opts, err = controllerapi.ResolveOptionPaths(opts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var ref string
 	var retErr error
 	var resp *client.SolveResponse
+	var inputs *build.Inputs
 
 	var f *ioset.SingleForwarder
 	var pr io.ReadCloser
@@ -444,7 +459,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 		})
 	}
 
-	ref, resp, err = c.Build(ctx, *opts, pr, printer)
+	ref, resp, inputs, err = c.Build(ctx, opts, pr, printer)
 	if err != nil {
 		var be *controllererrors.BuildError
 		if errors.As(err, &be) {
@@ -452,7 +467,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 			retErr = err
 			// We can proceed to monitor
 		} else {
-			return nil, errors.Wrapf(err, "failed to build")
+			return nil, nil, errors.Wrapf(err, "failed to build")
 		}
 	}
 
@@ -493,7 +508,7 @@ func runControllerBuild(ctx context.Context, dockerCli command.Cli, opts *contro
 		}
 	}
 
-	return resp, retErr
+	return resp, inputs, retErr
 }
 
 func printError(err error, printer *progress.Printer) error {
@@ -634,8 +649,8 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 		cobrautil.MarkFlagsExperimental(flags, "root", "detach", "server-config")
 	}
 
-	flags.StringVar(&options.printFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
-	flags.VarPF(callAlias(&options.printFunc, "check"), "check", "", `Shorthand for "--call=check"`)
+	flags.StringVar(&options.callFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
+	flags.VarPF(callAlias(&options.callFunc, "check"), "check", "", `Shorthand for "--call=check"`)
 	flags.Lookup("check").NoOptDefVal = "true"
 
 	// hidden flags
@@ -644,7 +659,7 @@ func buildCmd(dockerCli command.Cli, rootOpts *rootOptions, debugConfig *debug.D
 	var ignoreBool bool
 	var ignoreInt int64
 
-	flags.StringVar(&options.printFunc, "print", "", "Print result of information request (e.g., outline, targets)")
+	flags.StringVar(&options.callFunc, "print", "", "Print result of information request (e.g., outline, targets)")
 	cobrautil.MarkFlagsExperimental(flags, "print")
 	flags.MarkHidden("print")
 
@@ -731,9 +746,17 @@ func writeMetadataFile(filename string, dt interface{}) error {
 }
 
 func decodeExporterResponse(exporterResponse map[string]string) map[string]interface{} {
+	decFunc := func(k, v string) ([]byte, error) {
+		if k == "result.json" {
+			// result.json is part of metadata response for subrequests which
+			// is already a JSON object: https://github.com/moby/buildkit/blob/f6eb72f2f5db07ddab89ac5e2bd3939a6444f4be/frontend/dockerui/requests.go#L100-L102
+			return []byte(v), nil
+		}
+		return base64.StdEncoding.DecodeString(v)
+	}
 	out := make(map[string]interface{})
 	for k, v := range exporterResponse {
-		dt, err := base64.StdEncoding.DecodeString(v)
+		dt, err := decFunc(k, v)
 		if err != nil {
 			out[k] = v
 			continue
@@ -863,7 +886,7 @@ func printWarnings(w io.Writer, warnings []client.VertexWarning, mode progressui
 	}
 }
 
-func printResult(w io.Writer, f *controllerapi.PrintFunc, res map[string]string) (int, error) {
+func printResult(w io.Writer, f *controllerapi.CallFunc, res map[string]string, target string, inp *build.Inputs) (int, error) {
 	switch f.Name {
 	case "outline":
 		return 0, printValue(w, outline.PrintOutline, outline.SubrequestsOutlineDefinition.Version, f.Format, res)
@@ -872,17 +895,48 @@ func printResult(w io.Writer, f *controllerapi.PrintFunc, res map[string]string)
 	case "subrequests.describe":
 		return 0, printValue(w, subrequests.PrintDescribe, subrequests.SubrequestsDescribeDefinition.Version, f.Format, res)
 	case "lint":
-		err := printValue(w, lint.PrintLintViolations, lint.SubrequestLintDefinition.Version, f.Format, res)
-		if err != nil {
-			return 0, err
-		}
-
 		lintResults := lint.LintResults{}
 		if result, ok := res["result.json"]; ok {
 			if err := json.Unmarshal([]byte(result), &lintResults); err != nil {
 				return 0, err
 			}
 		}
+
+		warningCount := len(lintResults.Warnings)
+		if f.Format != "json" && warningCount > 0 {
+			var warningCountMsg string
+			if warningCount == 1 {
+				warningCountMsg = "1 warning has been found!"
+			} else if warningCount > 1 {
+				warningCountMsg = fmt.Sprintf("%d warnings have been found!", warningCount)
+			}
+			fmt.Fprintf(w, "Check complete, %s\n", warningCountMsg)
+		}
+		sourceInfoMap := func(sourceInfo *solverpb.SourceInfo) *solverpb.SourceInfo {
+			if sourceInfo == nil || inp == nil {
+				return sourceInfo
+			}
+			if target == "" {
+				target = "default"
+			}
+
+			if inp.DockerfileMappingSrc != "" {
+				newSourceInfo := proto.Clone(sourceInfo).(*solverpb.SourceInfo)
+				newSourceInfo.Filename = inp.DockerfileMappingSrc
+				return newSourceInfo
+			}
+			return sourceInfo
+		}
+
+		printLintWarnings := func(dt []byte, w io.Writer) error {
+			return lintResults.PrintTo(w, sourceInfoMap)
+		}
+
+		err := printValue(w, printLintWarnings, lint.SubrequestLintDefinition.Version, f.Format, res)
+		if err != nil {
+			return 0, err
+		}
+
 		if lintResults.Error != nil {
 			// Print the error message and the source
 			// Normally, we would use `errdefs.WithSource` to attach the source to the
@@ -893,13 +947,8 @@ func printResult(w io.Writer, f *controllerapi.PrintFunc, res map[string]string)
 			if f.Format != "json" && len(lintResults.Warnings) > 0 {
 				fmt.Fprintln(w)
 			}
-			lintBuf := bytes.NewBuffer([]byte(lintResults.Error.Message + "\n"))
-			sourceInfo := lintResults.Sources[lintResults.Error.Location.SourceIndex]
-			source := errdefs.Source{
-				Info:   sourceInfo,
-				Ranges: lintResults.Error.Location.Ranges,
-			}
-			source.Print(lintBuf)
+			lintBuf := bytes.NewBuffer(nil)
+			lintResults.PrintErrorTo(lintBuf, sourceInfoMap)
 			return 0, errors.New(lintBuf.String())
 		} else if len(lintResults.Warnings) == 0 && f.Format != "json" {
 			fmt.Fprintln(w, "Check complete, no warnings found.")
@@ -921,9 +970,9 @@ func printResult(w io.Writer, f *controllerapi.PrintFunc, res map[string]string)
 	return 0, nil
 }
 
-type printFunc func([]byte, io.Writer) error
+type callFunc func([]byte, io.Writer) error
 
-func printValue(w io.Writer, printer printFunc, version string, format string, res map[string]string) error {
+func printValue(w io.Writer, printer callFunc, version string, format string, res map[string]string) error {
 	if format == "json" {
 		fmt.Fprintln(w, res["result.json"])
 		return nil
@@ -964,7 +1013,7 @@ func (cfg *invokeConfig) runDebug(ctx context.Context, ref string, options *cont
 		return nil, errors.Errorf("failed to configure terminal: %v", err)
 	}
 	defer con.Reset()
-	return monitor.RunMonitor(ctx, ref, options, cfg.InvokeConfig, c, stdin, stdout, stderr, progress)
+	return monitor.RunMonitor(ctx, ref, options, &cfg.InvokeConfig, c, stdin, stdout, stderr, progress)
 }
 
 func (cfg *invokeConfig) parseInvokeConfig(invoke, on string) error {

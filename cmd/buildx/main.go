@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/docker/buildx/commands"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/version"
 	"github.com/docker/cli/cli"
@@ -16,6 +17,7 @@ import (
 	cliflags "github.com/docker/cli/cli/flags"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/util/stack"
+	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel"
 
 	//nolint:staticcheck // vendored dependencies may still use this
@@ -27,6 +29,9 @@ import (
 	_ "github.com/docker/buildx/driver/docker-container"
 	_ "github.com/docker/buildx/driver/kubernetes"
 	_ "github.com/docker/buildx/driver/remote"
+
+	// Use custom grpc codec to utilize vtprotobuf
+	_ "github.com/moby/buildkit/util/grpcutil/encoding/proto"
 )
 
 func init() {
@@ -70,6 +75,16 @@ func runPlugin(cmd *command.DockerCli) error {
 	})
 }
 
+func run(cmd *command.DockerCli) error {
+	stopProfiles := setupDebugProfiles(context.TODO())
+	defer stopProfiles()
+
+	if plugin.RunningStandalone() {
+		return runStandalone(cmd)
+	}
+	return runPlugin(cmd)
+}
+
 func main() {
 	cmd, err := command.NewDockerCli()
 	if err != nil {
@@ -77,15 +92,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if plugin.RunningStandalone() {
-		err = runStandalone(cmd)
-	} else {
-		err = runPlugin(cmd)
-	}
-	if err == nil {
+	if err = run(cmd); err == nil {
 		return
 	}
 
+	// Check the error from the run function above.
 	if sterr, ok := err.(cli.StatusError); ok {
 		if sterr.Status != "" {
 			fmt.Fprintln(cmd.Err(), sterr.Status)
@@ -106,8 +117,15 @@ func main() {
 	} else {
 		fmt.Fprintf(cmd.Err(), "ERROR: %v\n", err)
 	}
-	if ebr, ok := err.(*desktop.ErrorWithBuildRef); ok {
+
+	var ebr *desktop.ErrorWithBuildRef
+	if errors.As(err, &ebr) {
 		ebr.Print(cmd.Err())
+	} else {
+		var be *controllererrors.BuildError
+		if errors.As(err, &be) {
+			be.PrintBuildDetails(cmd.Err())
+		}
 	}
 
 	os.Exit(1)

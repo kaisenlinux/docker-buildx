@@ -148,8 +148,8 @@ func serveCmd(dockerCli command.Cli) *cobra.Command {
 			}()
 
 			// prepare server
-			b := NewServer(func(ctx context.Context, options *controllerapi.BuildOptions, stdin io.Reader, progress progress.Writer) (*client.SolveResponse, *build.ResultHandle, error) {
-				return cbuild.RunBuild(ctx, dockerCli, *options, stdin, progress, true)
+			b := NewServer(func(ctx context.Context, options *controllerapi.BuildOptions, stdin io.Reader, progress progress.Writer) (*client.SolveResponse, *build.ResultHandle, *build.Inputs, error) {
+				return cbuild.RunBuild(ctx, dockerCli, options, stdin, progress, true)
 			})
 			defer b.Close()
 
@@ -258,7 +258,7 @@ func prepareRootDir(dockerCli command.Cli, config *serverConfig) (string, error)
 }
 
 func rootDataDir(dockerCli command.Cli) string {
-	return filepath.Join(confutil.ConfigDir(dockerCli), "controller")
+	return filepath.Join(confutil.NewConfig(dockerCli).Dir(), "controller")
 }
 
 func newBuildxClientAndCheck(ctx context.Context, addr string) (*Client, error) {

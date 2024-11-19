@@ -13,6 +13,7 @@ Inspect current builder instance
 |:----------------------------|:---------|:--------|:--------------------------------------------|
 | [`--bootstrap`](#bootstrap) | `bool`   |         | Ensure builder has booted before inspecting |
 | [`--builder`](#builder)     | `string` |         | Override the configured builder instance    |
+| `-D`, `--debug`             | `bool`   |         | Enable debug logging                        |
 
 
 <!---MARKER_GEN_END-->
@@ -43,8 +44,7 @@ name of the builder to inspect to get information about that builder.
 The following example shows information about a builder instance named
 `elated_tesla`:
 
-> **Note**
->
+> [!NOTE]
 > The asterisk (`*`) next to node build platform(s) indicate they have been
 > manually set during `buildx create`. Otherwise the platforms were
 > automatically detected.

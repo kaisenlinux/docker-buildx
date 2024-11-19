@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/session/auth/authprovider"
+	"github.com/moby/buildkit/util/entitlements"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/go-csvvalue"
 	"github.com/zclconf/go-cty/cty"
@@ -479,7 +481,7 @@ func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[st
 	for _, v := range t.Contexts {
 		if strings.HasPrefix(v, "target:") {
 			target := strings.TrimPrefix(v, "target:")
-			if target == t.Name {
+			if target == name {
 				return errors.Errorf("target %s cannot link to itself", target)
 			}
 			for _, v := range visited {
@@ -501,6 +503,14 @@ func (c Config) loadLinks(name string, t *Target, m map[string]*Target, o map[st
 			if err := c.loadLinks(target, t2, m, o, visited); err != nil {
 				return err
 			}
+
+			// entitlements are inherited from linked targets
+			for _, ent := range t2.Entitlements {
+				if !slices.Contains(t.Entitlements, ent) {
+					t.Entitlements = append(t.Entitlements, ent)
+				}
+			}
+
 			if len(t.Platforms) > 1 && len(t2.Platforms) > 1 {
 				if !sliceEqual(t.Platforms, t2.Platforms) {
 					return errors.Errorf("target %s can't be used by %s because it is defined for different platforms %v and %v", target, name, t2.Platforms, t.Platforms)
@@ -542,7 +552,7 @@ func (c Config) newOverrides(v []string) (map[string]map[string]Override, error)
 			o := t[kk[1]]
 
 			switch keys[1] {
-			case "output", "cache-to", "cache-from", "tags", "platform", "secrets", "ssh", "attest":
+			case "output", "cache-to", "cache-from", "tags", "platform", "secrets", "ssh", "attest", "entitlements", "network":
 				if len(parts) == 2 {
 					o.ArrValue = append(o.ArrValue, parts[1])
 				}
@@ -703,11 +713,12 @@ type Target struct {
 	Outputs          []string           `json:"output,omitempty" hcl:"output,optional" cty:"output"`
 	Pull             *bool              `json:"pull,omitempty" hcl:"pull,optional" cty:"pull"`
 	NoCache          *bool              `json:"no-cache,omitempty" hcl:"no-cache,optional" cty:"no-cache"`
-	NetworkMode      *string            `json:"-" hcl:"-" cty:"-"`
+	NetworkMode      *string            `json:"network,omitempty" hcl:"network,optional" cty:"network"`
 	NoCacheFilter    []string           `json:"no-cache-filter,omitempty" hcl:"no-cache-filter,optional" cty:"no-cache-filter"`
 	ShmSize          *string            `json:"shm-size,omitempty" hcl:"shm-size,optional"`
 	Ulimits          []string           `json:"ulimits,omitempty" hcl:"ulimits,optional"`
 	Call             *string            `json:"call,omitempty" hcl:"call,optional" cty:"call"`
+	Entitlements     []string           `json:"entitlements,omitempty" hcl:"entitlements,optional" cty:"entitlements"`
 	// IMPORTANT: if you add more fields here, do not forget to update newOverrides/AddOverrides and docs/bake-reference.md.
 
 	// linked is a private field to mark a target used as a linked one
@@ -731,6 +742,12 @@ func (t *Target) normalize() {
 	t.Outputs = removeDupes(t.Outputs)
 	t.NoCacheFilter = removeDupes(t.NoCacheFilter)
 	t.Ulimits = removeDupes(t.Ulimits)
+
+	if t.NetworkMode != nil && *t.NetworkMode == "host" {
+		t.Entitlements = append(t.Entitlements, "network.host")
+	}
+
+	t.Entitlements = removeDupes(t.Entitlements)
 
 	for k, v := range t.Contexts {
 		if v == "" {
@@ -831,6 +848,9 @@ func (t *Target) Merge(t2 *Target) {
 	if t2.Description != "" {
 		t.Description = t2.Description
 	}
+	if t2.Entitlements != nil { // merge
+		t.Entitlements = append(t.Entitlements, t2.Entitlements...)
+	}
 	t.Inherits = append(t.Inherits, t2.Inherits...)
 }
 
@@ -885,6 +905,8 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.Platforms = o.ArrValue
 		case "output":
 			t.Outputs = o.ArrValue
+		case "entitlements":
+			t.Entitlements = append(t.Entitlements, o.ArrValue...)
 		case "annotations":
 			t.Annotations = append(t.Annotations, o.ArrValue...)
 		case "attest":
@@ -901,6 +923,8 @@ func (t *Target) AddOverrides(overrides map[string]Override) error {
 			t.ShmSize = &value
 		case "ulimits":
 			t.Ulimits = o.ArrValue
+		case "network":
+			t.NetworkMode = &value
 		case "pull":
 			pull, err := strconv.ParseBool(value)
 			if err != nil {
@@ -1313,7 +1337,7 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 	}
 
 	if t.Call != nil {
-		bo.PrintFunc = &build.PrintFunc{
+		bo.CallFunc = &build.CallFunc{
 			Name: *t.Call,
 		}
 	}
@@ -1367,6 +1391,10 @@ func toBuildOpt(t *Target, inp *Input) (*build.Options, error) {
 		}
 	}
 	bo.Ulimits = ulimits
+
+	for _, ent := range t.Entitlements {
+		bo.Allow = append(bo.Allow, entitlements.Entitlement(ent))
+	}
 
 	return bo, nil
 }

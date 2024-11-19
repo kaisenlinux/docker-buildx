@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"os"
 
 	debugcmd "github.com/docker/buildx/commands/debug"
@@ -21,6 +22,7 @@ import (
 )
 
 func NewRootCmd(name string, isPlugin bool, dockerCli command.Cli) *cobra.Command {
+	var opt rootOptions
 	cmd := &cobra.Command{
 		Short: "Docker Buildx",
 		Long:  `Extended build capabilities with BuildKit`,
@@ -32,11 +34,24 @@ func NewRootCmd(name string, isPlugin bool, dockerCli command.Cli) *cobra.Comman
 			HiddenDefaultCmd: true,
 		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if opt.debug {
+				debug.Enable()
+			}
 			cmd.SetContext(appcontext.Context())
 			if !isPlugin {
 				return nil
 			}
 			return plugin.PersistentPreRunE(cmd, args)
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return cmd.Help()
+			}
+			_ = cmd.Help()
+			return cli.StatusError{
+				StatusCode: 1,
+				Status:     fmt.Sprintf("ERROR: unknown command: %q", args[0]),
+			}
 		},
 	}
 	if !isPlugin {
@@ -47,11 +62,6 @@ func NewRootCmd(name string, isPlugin bool, dockerCli command.Cli) *cobra.Comman
 		cmd.TraverseChildren = true
 		cmd.DisableFlagsInUseLine = true
 		cli.DisableFlagsInUseLine(cmd)
-
-		// DEBUG=1 should perform the same as --debug at the docker root level
-		if debug.IsEnabled() {
-			debug.Enable()
-		}
 	}
 
 	logrus.SetFormatter(&logutil.Formatter{})
@@ -68,16 +78,16 @@ func NewRootCmd(name string, isPlugin bool, dockerCli command.Cli) *cobra.Comman
 		cmd.SetHelpTemplate(cmd.HelpTemplate() + "\nExperimental commands and flags are hidden. Set BUILDX_EXPERIMENTAL=1 to show them.\n")
 	}
 
-	addCommands(cmd, dockerCli)
+	addCommands(cmd, &opt, dockerCli)
 	return cmd
 }
 
 type rootOptions struct {
 	builder string
+	debug   bool
 }
 
-func addCommands(cmd *cobra.Command, dockerCli command.Cli) {
-	opts := &rootOptions{}
+func addCommands(cmd *cobra.Command, opts *rootOptions, dockerCli command.Cli) {
 	rootFlags(opts, cmd.PersistentFlags())
 
 	cmd.AddCommand(
@@ -95,7 +105,7 @@ func addCommands(cmd *cobra.Command, dockerCli command.Cli) {
 		versionCmd(dockerCli),
 		pruneCmd(dockerCli, opts),
 		duCmd(dockerCli, opts),
-		imagetoolscmd.RootCmd(dockerCli, imagetoolscmd.RootOptions{Builder: &opts.builder}),
+		imagetoolscmd.RootCmd(cmd, dockerCli, imagetoolscmd.RootOptions{Builder: &opts.builder}),
 	)
 	if confutil.IsExperimental() {
 		cmd.AddCommand(debugcmd.RootCmd(dockerCli,
@@ -112,4 +122,5 @@ func addCommands(cmd *cobra.Command, dockerCli command.Cli) {
 
 func rootFlags(options *rootOptions, flags *pflag.FlagSet) {
 	flags.StringVar(&options.builder, "builder", os.Getenv("BUILDX_BUILDER"), "Override the configured builder instance")
+	flags.BoolVarP(&options.debug, "debug", "D", debug.IsEnabled(), "Enable debug logging")
 }

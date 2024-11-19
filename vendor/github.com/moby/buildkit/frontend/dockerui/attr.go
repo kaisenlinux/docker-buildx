@@ -74,11 +74,11 @@ func parseShmSize(v string) (int64, error) {
 	return kb, nil
 }
 
-func parseUlimits(v string) ([]pb.Ulimit, error) {
+func parseUlimits(v string) ([]*pb.Ulimit, error) {
 	if v == "" {
 		return nil, nil
 	}
-	out := make([]pb.Ulimit, 0)
+	out := make([]*pb.Ulimit, 0)
 	fields, err := csvvalue.Fields(v, nil)
 	if err != nil {
 		return nil, err
@@ -88,7 +88,7 @@ func parseUlimits(v string) ([]pb.Ulimit, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, pb.Ulimit{
+		out = append(out, &pb.Ulimit{
 			Name: ulimit.Name,
 			Soft: ulimit.Soft,
 			Hard: ulimit.Hard,
@@ -123,6 +123,16 @@ func parseSourceDateEpoch(v string) (*time.Time, error) {
 	}
 	tm := time.Unix(sde, 0).UTC()
 	return &tm, nil
+}
+
+func parseLocalSessionIDs(opt map[string]string) map[string]string {
+	m := map[string]string{}
+	for k, v := range opt {
+		if strings.HasPrefix(k, localSessionIDPrefix) {
+			m[strings.TrimPrefix(k, localSessionIDPrefix)] = v
+		}
+	}
+	return m
 }
 
 func filter(opt map[string]string, key string) map[string]string {

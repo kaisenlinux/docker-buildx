@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/system"
@@ -127,9 +128,10 @@ func (e *ExecOp) Validate(ctx context.Context, c *Constraints) error {
 }
 
 func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
-	if e.Cached(c) {
-		return e.Load()
+	if dgst, dt, md, srcs, err := e.Load(c); err == nil {
+		return dgst, dt, md, srcs, nil
 	}
+
 	if err := e.Validate(ctx, c); err != nil {
 		return "", nil, nil, nil, err
 	}
@@ -192,6 +194,17 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		return "", nil, nil, nil, err
 	}
 
+	var validExitCodes []int32
+	if codes, err := getValidExitCodes(e.base)(ctx, c); err != nil {
+		return "", nil, nil, nil, err
+	} else if codes != nil {
+		validExitCodes = make([]int32, len(codes))
+		for i, code := range codes {
+			validExitCodes[i] = int32(code)
+		}
+		addCap(&e.constraints, pb.CapExecValidExitCode)
+	}
+
 	meta := &pb.Meta{
 		Args:                      args,
 		Env:                       env.ToArray(),
@@ -200,6 +213,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		Hostname:                  hostname,
 		CgroupParent:              cgrpParent,
 		RemoveMountStubsRecursive: true,
+		ValidExitCodes:            validExitCodes,
 	}
 
 	extraHosts, err := getExtraHosts(e.base)(ctx, c)
@@ -290,7 +304,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 	if len(e.secrets) > 0 {
 		addCap(&e.constraints, pb.CapExecMountSecret)
 		for _, s := range e.secrets {
-			if s.IsEnv {
+			if s.Env != nil {
 				addCap(&e.constraints, pb.CapExecSecretEnv)
 				break
 			}
@@ -329,7 +343,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 			newInput := true
 
 			for i, inp2 := range pop.Inputs {
-				if *inp == *inp2 {
+				if inp.EqualVT(inp2) {
 					inputIndex = pb.InputIndex(i)
 					newInput = false
 					break
@@ -350,10 +364,10 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		}
 
 		pm := &pb.Mount{
-			Input:    inputIndex,
+			Input:    int64(inputIndex),
 			Dest:     m.target,
 			Readonly: m.readonly,
-			Output:   outputIndex,
+			Output:   int64(outputIndex),
 			Selector: m.selector,
 		}
 		if m.cacheID != "" {
@@ -381,22 +395,24 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		if m.tmpfs {
 			pm.MountType = pb.MountType_TMPFS
 			pm.TmpfsOpt = &pb.TmpfsOpt{
-				Size_: m.tmpfsOpt.Size,
+				Size: m.tmpfsOpt.Size,
 			}
 		}
 		peo.Mounts = append(peo.Mounts, pm)
 	}
 
 	for _, s := range e.secrets {
-		if s.IsEnv {
+		if s.Env != nil {
 			peo.Secretenv = append(peo.Secretenv, &pb.SecretEnv{
 				ID:       s.ID,
-				Name:     s.Target,
+				Name:     *s.Env,
 				Optional: s.Optional,
 			})
-		} else {
+		}
+		if s.Target != nil {
 			pm := &pb.Mount{
-				Dest:      s.Target,
+				Input:     int64(pb.Empty),
+				Dest:      *s.Target,
 				MountType: pb.MountType_SECRET,
 				SecretOpt: &pb.SecretOpt{
 					ID:       s.ID,
@@ -412,6 +428,7 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 
 	for _, s := range e.ssh {
 		pm := &pb.Mount{
+			Input:     int64(pb.Empty),
 			Dest:      s.Target,
 			MountType: pb.MountType_SSH,
 			SSHOpt: &pb.SSHOpt{
@@ -425,12 +442,11 @@ func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []
 		peo.Mounts = append(peo.Mounts, pm)
 	}
 
-	dt, err := pop.Marshal()
+	dt, err := deterministicMarshal(pop)
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	e.Store(dt, md, e.constraints.SourceLocations, c)
-	return e.Load()
+	return e.Store(dt, md, e.constraints.SourceLocations, c)
 }
 
 func (e *ExecOp) Output() Output {
@@ -577,6 +593,7 @@ func Shlex(str string) RunOption {
 		ei.State = shlexf(str, false)(ei.State)
 	})
 }
+
 func Shlexf(str string, v ...interface{}) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
 		ei.State = shlexf(str, true, v...)(ei.State)
@@ -598,6 +615,12 @@ func AddExtraHost(host string, ip net.IP) RunOption {
 func AddUlimit(name UlimitName, soft int64, hard int64) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
 		ei.State = ei.State.AddUlimit(name, soft, hard)
+	})
+}
+
+func ValidExitCodes(codes ...int) RunOption {
+	return runOptionFunc(func(ei *ExecInfo) {
+		ei.State = validExitCodes(codes...)(ei.State)
 	})
 }
 
@@ -678,7 +701,19 @@ type SSHInfo struct {
 // AddSecret is a RunOption that adds a secret to the exec.
 func AddSecret(dest string, opts ...SecretOption) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
-		s := &SecretInfo{ID: dest, Target: dest, Mode: 0400}
+		s := &SecretInfo{ID: dest, Target: &dest, Mode: 0400}
+		for _, opt := range opts {
+			opt.SetSecretOption(s)
+		}
+		ei.Secrets = append(ei.Secrets, *s)
+	})
+}
+
+// AddSecretWithDest is a RunOption that adds a secret to the exec
+// with an optional destination.
+func AddSecretWithDest(src string, dest *string, opts ...SecretOption) RunOption {
+	return runOptionFunc(func(ei *ExecInfo) {
+		s := &SecretInfo{ID: src, Target: dest, Mode: 0400}
 		for _, opt := range opts {
 			opt.SetSecretOption(s)
 		}
@@ -697,13 +732,15 @@ func (fn secretOptionFunc) SetSecretOption(si *SecretInfo) {
 }
 
 type SecretInfo struct {
-	ID       string
-	Target   string
+	ID string
+	// Target optionally specifies the target for the secret mount
+	Target *string
+	// Env optionally names the environment variable for the secret
+	Env      *string
 	Mode     int
 	UID      int
 	GID      int
 	Optional bool
-	IsEnv    bool
 }
 
 var SecretOptional = secretOptionFunc(func(si *SecretInfo) {
@@ -719,7 +756,24 @@ func SecretID(id string) SecretOption {
 // SecretAsEnv defines if the secret should be added as an environment variable
 func SecretAsEnv(v bool) SecretOption {
 	return secretOptionFunc(func(si *SecretInfo) {
-		si.IsEnv = v
+		if !v {
+			si.Env = nil
+			return
+		}
+		if si.Target == nil {
+			return
+		}
+		target := strings.Clone(*si.Target)
+		si.Env = &target
+		si.Target = nil
+	})
+}
+
+// SecretAsEnvName defines if the secret should be added as an environment variable
+// with the specified name
+func SecretAsEnvName(v string) SecretOption {
+	return secretOptionFunc(func(si *SecretInfo) {
+		si.Env = &v
 	})
 }
 

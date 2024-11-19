@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"slices"
+	"sort"
 	"strings"
+	"sync"
 	"text/tabwriter"
 
 	"github.com/containerd/console"
@@ -26,14 +30,15 @@ import (
 	"github.com/docker/buildx/util/confutil"
 	"github.com/docker/buildx/util/desktop"
 	"github.com/docker/buildx/util/dockerutil"
+	"github.com/docker/buildx/util/osutil"
 	"github.com/docker/buildx/util/progress"
 	"github.com/docker/buildx/util/tracing"
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type bakeOptions struct {
@@ -44,6 +49,7 @@ type bakeOptions struct {
 	listVars    bool
 	sbom        string
 	provenance  string
+	allow       []string
 
 	builder      string
 	metadataFile string
@@ -53,6 +59,8 @@ type bakeOptions struct {
 }
 
 func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in bakeOptions, cFlags commonFlags) (err error) {
+	mp := dockerCli.MeterProvider()
+
 	ctx, end, err := tracing.TraceCurrentCommand(ctx, "bake")
 	if err != nil {
 		return err
@@ -61,27 +69,12 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		end(err)
 	}()
 
-	var url string
-	cmdContext := "cwd://"
-
-	if len(targets) > 0 {
-		if build.IsRemoteURL(targets[0]) {
-			url = targets[0]
-			targets = targets[1:]
-			if len(targets) > 0 {
-				if build.IsRemoteURL(targets[0]) {
-					cmdContext = targets[0]
-					targets = targets[1:]
-				}
-			}
-		}
-	}
-
+	url, cmdContext, targets := bakeArgs(targets)
 	if len(targets) == 0 {
 		targets = []string{"default"}
 	}
 
-	callFunc, err := buildflags.ParsePrintFunc(in.callFunc)
+	callFunc, err := buildflags.ParseCallFunc(in.callFunc)
 	if err != nil {
 		return err
 	}
@@ -110,6 +103,11 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	}
 	contextPathHash, _ := os.Getwd()
 
+	ent, err := bake.ParseEntitlements(in.allow)
+	if err != nil {
+		return err
+	}
+
 	ctx2, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
@@ -117,7 +115,8 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	var progressConsoleDesc, progressTextDesc string
 
 	// instance only needed for reading remote bake files or building
-	if url != "" || !in.printOnly {
+	var driverType string
+	if url != "" || !(in.printOnly || in.listTargets || in.listVars) {
 		b, err := builder.New(dockerCli,
 			builder.WithName(in.builder),
 			builder.WithContextPathHash(contextPathHash),
@@ -134,53 +133,33 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		}
 		progressConsoleDesc = fmt.Sprintf("%s:%s", b.Driver, b.Name)
 		progressTextDesc = fmt.Sprintf("building with %q instance using %s driver", b.Name, b.Driver)
+		driverType = b.Driver
 	}
 
 	var term bool
 	if _, err := console.ConsoleFromFile(os.Stderr); err == nil {
 		term = true
 	}
+	attributes := bakeMetricAttributes(dockerCli, driverType, url, cmdContext, targets, &in)
 
 	progressMode := progressui.DisplayMode(cFlags.progress)
 	var printer *progress.Printer
-	printer, err = progress.NewPrinter(ctx2, os.Stderr, progressMode,
-		progress.WithDesc(progressTextDesc, progressConsoleDesc),
-		progress.WithOnClose(func() {
-			if p := printer; p != nil {
-				printWarnings(os.Stderr, p.Warnings(), progressMode)
-			}
-		}),
-	)
-	if err != nil {
+
+	makePrinter := func() error {
+		var err error
+		printer, err = progress.NewPrinter(ctx2, os.Stderr, progressMode,
+			progress.WithDesc(progressTextDesc, progressConsoleDesc),
+			progress.WithMetrics(mp, attributes),
+			progress.WithOnClose(func() {
+				printWarnings(os.Stderr, printer.Warnings(), progressMode)
+			}),
+		)
 		return err
 	}
 
-	var resp map[string]*client.SolveResponse
-
-	defer func() {
-		if printer != nil {
-			err1 := printer.Wait()
-			if err == nil {
-				err = err1
-			}
-			if err != nil {
-				return
-			}
-			if progressMode != progressui.QuietMode && progressMode != progressui.RawJSONMode {
-				desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
-			}
-			if resp != nil && len(in.metadataFile) > 0 {
-				dt := make(map[string]interface{})
-				for t, r := range resp {
-					dt[t] = decodeExporterResponse(r.ExporterResponse)
-				}
-				if warnings := printer.Warnings(); len(warnings) > 0 && confutil.MetadataWarningsEnabled() {
-					dt["buildx.build.warnings"] = warnings
-				}
-				err = writeMetadataFile(in.metadataFile, dt)
-			}
-		}
-	}()
+	if err := makePrinter(); err != nil {
+		return err
+	}
 
 	files, inp, err := readBakeFiles(ctx, nodes, url, in.files, dockerCli.In(), printer)
 	if err != nil {
@@ -203,10 +182,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		if err != nil {
 			return err
 		}
-
-		err = printer.Wait()
-		printer = nil
-		if err != nil {
+		if err = printer.Wait(); err != nil {
 			return err
 		}
 		if in.listTargets {
@@ -249,68 +225,79 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	}
 
 	if in.printOnly {
-		dt, err := json.MarshalIndent(def, "", "  ")
+		if err = printer.Wait(); err != nil {
+			return err
+		}
+		dtdef, err := json.MarshalIndent(def, "", "  ")
 		if err != nil {
 			return err
 		}
-		err = printer.Wait()
-		printer = nil
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(dockerCli.Out(), string(dt))
-		return nil
+		_, err = fmt.Fprintln(dockerCli.Out(), string(dtdef))
+		return err
 	}
 
 	for _, opt := range bo {
-		if opt.PrintFunc != nil {
-			cf, err := buildflags.ParsePrintFunc(opt.PrintFunc.Name)
+		if opt.CallFunc != nil {
+			cf, err := buildflags.ParseCallFunc(opt.CallFunc.Name)
 			if err != nil {
 				return err
 			}
-			opt.PrintFunc.Name = cf.Name
+			opt.CallFunc.Name = cf.Name
 		}
 	}
 
-	prm := confutil.MetadataProvenance()
-	if len(in.metadataFile) == 0 {
-		prm = confutil.MetadataProvenanceModeDisabled
-	}
-
-	groupRef := identity.NewID()
-	var refs []string
-	for k, b := range bo {
-		b.Ref = identity.NewID()
-		b.GroupRef = groupRef
-		b.ProvenanceResponseMode = prm
-		refs = append(refs, b.Ref)
-		bo[k] = b
-	}
-	dt, err := json.Marshal(def)
+	exp, err := ent.Validate(bo)
 	if err != nil {
 		return err
 	}
-	if err := saveLocalStateGroup(dockerCli, groupRef, localstate.StateGroup{
-		Definition: dt,
-		Targets:    targets,
-		Inputs:     overrides,
-		Refs:       refs,
-	}); err != nil {
+	if err := exp.Prompt(ctx, &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
+		return err
+	}
+	if printer.IsDone() {
+		// init new printer as old one was stopped to show the prompt
+		if err := makePrinter(); err != nil {
+			return err
+		}
+	}
+
+	if err := saveLocalStateGroup(dockerCli, in, targets, bo, overrides, def); err != nil {
 		return err
 	}
 
-	resp, err = build.Build(ctx, nodes, bo, dockerutil.NewClient(dockerCli), confutil.ConfigDir(dockerCli), printer)
-	if err != nil {
-		return wrapBuildError(err, true)
+	done := timeBuildCommand(mp, attributes)
+	resp, retErr := build.Build(ctx, nodes, bo, dockerutil.NewClient(dockerCli), confutil.NewConfig(dockerCli), printer)
+	if err := printer.Wait(); retErr == nil {
+		retErr = err
 	}
+	if retErr != nil {
+		err = wrapBuildError(retErr, true)
+	}
+	done(err)
 
-	err = printer.Wait()
 	if err != nil {
 		return err
+	}
+
+	if progressMode != progressui.QuietMode && progressMode != progressui.RawJSONMode {
+		desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
+	}
+	if len(in.metadataFile) > 0 {
+		dt := make(map[string]interface{})
+		for t, r := range resp {
+			dt[t] = decodeExporterResponse(r.ExporterResponse)
+		}
+		if callFunc == nil {
+			if warnings := printer.Warnings(); len(warnings) > 0 && confutil.MetadataWarningsEnabled() {
+				dt["buildx.build.warnings"] = warnings
+			}
+		}
+		if err := writeMetadataFile(in.metadataFile, dt); err != nil {
+			return err
+		}
 	}
 
 	var callFormatJSON bool
-	var jsonResults = map[string]map[string]any{}
+	jsonResults := map[string]map[string]any{}
 	if callFunc != nil {
 		callFormatJSON = callFunc.Format == "json"
 	}
@@ -325,14 +312,14 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 
 	for _, name := range names {
 		req := bo[name]
-		if req.PrintFunc == nil {
+		if req.CallFunc == nil {
 			continue
 		}
 
-		pf := &pb.PrintFunc{
-			Name:         req.PrintFunc.Name,
-			Format:       req.PrintFunc.Format,
-			IgnoreStatus: req.PrintFunc.IgnoreStatus,
+		pf := &pb.CallFunc{
+			Name:         req.CallFunc.Name,
+			Format:       req.CallFunc.Format,
+			IgnoreStatus: req.CallFunc.IgnoreStatus,
 		}
 
 		if callFunc != nil {
@@ -348,7 +335,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		if callFormatJSON {
 			jsonResults[name] = map[string]any{}
 			buf := &bytes.Buffer{}
-			if code, err := printResult(buf, pf, res); err != nil {
+			if code, err := printResult(buf, pf, res, name, &req.Inputs); err != nil {
 				jsonResults[name]["error"] = err.Error()
 				exitCode = 1
 			} else if code != 0 && exitCode == 0 {
@@ -374,7 +361,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 			}
 
 			fmt.Fprintln(dockerCli.Out())
-			if code, err := printResult(dockerCli.Out(), pf, res); err != nil {
+			if code, err := printResult(dockerCli.Out(), pf, res, name, &req.Inputs); err != nil {
 				fmt.Fprintf(dockerCli.Out(), "error: %v\n", err)
 				exitCode = 1
 			} else if code != 0 && exitCode == 0 {
@@ -396,7 +383,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 				"build": def,
 			}
 			if res, ok := jsonResults[name]; ok {
-				printName := bo[name].PrintFunc.Name
+				printName := bo[name].CallFunc.Name
 				if printName == "lint" {
 					printName = "check"
 				}
@@ -451,6 +438,7 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--set=*.attest=type=provenance"`)
 	flags.StringArrayVar(&options.overrides, "set", nil, `Override target value (e.g., "targetpattern.key=value")`)
 	flags.StringVar(&options.callFunc, "call", "build", `Set method for evaluating build ("check", "outline", "targets")`)
+	flags.StringArrayVar(&options.allow, "allow", nil, "Allow build to access specified resources")
 
 	flags.VarPF(callAlias(&options.callFunc, "check"), "check", "", `Shorthand for "--call=check"`)
 	flags.Lookup("check").NoOptDefVal = "true"
@@ -468,12 +456,55 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	return cmd
 }
 
-func saveLocalStateGroup(dockerCli command.Cli, ref string, lsg localstate.StateGroup) error {
-	l, err := localstate.New(confutil.ConfigDir(dockerCli))
+func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string, bo map[string]build.Options, overrides []string, def any) error {
+	prm := confutil.MetadataProvenance()
+	if len(in.metadataFile) == 0 {
+		prm = confutil.MetadataProvenanceModeDisabled
+	}
+	groupRef := identity.NewID()
+	refs := make([]string, 0, len(bo))
+	for k, b := range bo {
+		if b.CallFunc != nil {
+			continue
+		}
+		b.Ref = identity.NewID()
+		b.GroupRef = groupRef
+		b.ProvenanceResponseMode = prm
+		refs = append(refs, b.Ref)
+		bo[k] = b
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	l, err := localstate.New(confutil.NewConfig(dockerCli))
 	if err != nil {
 		return err
 	}
-	return l.SaveGroup(ref, lsg)
+	dtdef, err := json.MarshalIndent(def, "", "  ")
+	if err != nil {
+		return err
+	}
+	return l.SaveGroup(groupRef, localstate.StateGroup{
+		Definition: dtdef,
+		Targets:    targets,
+		Inputs:     overrides,
+		Refs:       refs,
+	})
+}
+
+// bakeArgs will retrieve the remote url, command context, and targets
+// from the command line arguments.
+func bakeArgs(args []string) (url, cmdContext string, targets []string) {
+	cmdContext, targets = "cwd://", args
+	if len(targets) == 0 || !build.IsRemoteURL(targets[0]) {
+		return url, cmdContext, targets
+	}
+	url, targets = targets[0], targets[1:]
+	if len(targets) == 0 || !build.IsRemoteURL(targets[0]) {
+		return url, cmdContext, targets
+	}
+	cmdContext, targets = targets[0], targets[1:]
+	return url, cmdContext, targets
 }
 
 func readBakeFiles(ctx context.Context, nodes []builder.Node, url string, names []string, stdin io.Reader, pw progress.Writer) (files []bake.File, inp *bake.Input, err error) {
@@ -589,4 +620,86 @@ func printTargetList(w io.Writer, cfg *bake.Config) error {
 	}
 
 	return nil
+}
+
+func bakeMetricAttributes(dockerCli command.Cli, driverType, url, cmdContext string, targets []string, options *bakeOptions) attribute.Set {
+	return attribute.NewSet(
+		commandNameAttribute.String("bake"),
+		attribute.Stringer(string(commandOptionsHash), &bakeOptionsHash{
+			bakeOptions: options,
+			cfg:         confutil.NewConfig(dockerCli),
+			url:         url,
+			cmdContext:  cmdContext,
+			targets:     targets,
+		}),
+		driverNameAttribute.String(options.builder),
+		driverTypeAttribute.String(driverType),
+	)
+}
+
+type bakeOptionsHash struct {
+	*bakeOptions
+	cfg        *confutil.Config
+	url        string
+	cmdContext string
+	targets    []string
+	result     string
+	resultOnce sync.Once
+}
+
+func (o *bakeOptionsHash) String() string {
+	o.resultOnce.Do(func() {
+		url := o.url
+		cmdContext := o.cmdContext
+		if cmdContext == "cwd://" {
+			// Resolve the directory if the cmdContext is the current working directory.
+			cmdContext = osutil.GetWd()
+		}
+
+		// Sort the inputs for files and targets since the ordering
+		// doesn't matter, but avoid modifying the original slice.
+		files := immutableSort(o.files)
+		targets := immutableSort(o.targets)
+
+		joinedFiles := strings.Join(files, ",")
+		joinedTargets := strings.Join(targets, ",")
+		salt := o.cfg.TryNodeIdentifier()
+
+		h := sha256.New()
+		for _, s := range []string{url, cmdContext, joinedFiles, joinedTargets, salt} {
+			_, _ = io.WriteString(h, s)
+			h.Write([]byte{0})
+		}
+		o.result = hex.EncodeToString(h.Sum(nil))
+	})
+	return o.result
+}
+
+// immutableSort will sort the entries in s without modifying the original slice.
+func immutableSort(s []string) []string {
+	if !sort.StringsAreSorted(s) {
+		cpy := make([]string, len(s))
+		copy(cpy, s)
+		sort.Strings(cpy)
+		return cpy
+	}
+	return s
+}
+
+type syncWriter struct {
+	w    io.Writer
+	once sync.Once
+	wait func() error
+}
+
+func (w *syncWriter) Write(p []byte) (n int, err error) {
+	w.once.Do(func() {
+		if w.wait != nil {
+			err = w.wait()
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	return w.w.Write(p)
 }

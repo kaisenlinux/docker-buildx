@@ -13,6 +13,7 @@ import (
 	"github.com/docker/buildx/bake"
 	"github.com/docker/buildx/util/gitutil"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/frontend/subrequests/lint"
 	"github.com/moby/buildkit/identity"
 	provenancetypes "github.com/moby/buildkit/solver/llbsolver/provenance/types"
 	"github.com/moby/buildkit/util/contentutil"
@@ -56,6 +57,9 @@ var bakeTests = []func(t *testing.T, sb integration.Sandbox){
 	testListVariables,
 	testBakeCallCheck,
 	testBakeCallCheckFlag,
+	testBakeCallMetadata,
+	testBakeMultiPlatform,
+	testBakeCheckCallOutput,
 }
 
 func testBakePrint(t *testing.T, sb integration.Sandbox) {
@@ -99,6 +103,26 @@ target "build" {
 	require.Equal(t, ".", *def.Target["build"].Context)
 	require.Equal(t, "Dockerfile", *def.Target["build"].Dockerfile)
 	require.Equal(t, map[string]*string{"HELLO": ptrstr("foo")}, def.Target["build"].Args)
+
+	require.Equal(t, `{
+  "group": {
+    "default": {
+      "targets": [
+        "build"
+      ]
+    }
+  },
+  "target": {
+    "build": {
+      "context": ".",
+      "dockerfile": "Dockerfile",
+      "args": {
+        "HELLO": "foo"
+      }
+    }
+  }
+}
+`, stdout.String())
 }
 
 func testBakeLocal(t *testing.T, sb integration.Sandbox) {
@@ -887,6 +911,56 @@ target "def" {
 	require.Len(t, md.BuildWarnings, 3, string(dt))
 }
 
+func testBakeMultiPlatform(t *testing.T, sb integration.Sandbox) {
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+	target := registry + "/buildx/registry:latest"
+
+	dockerfile := []byte(`
+	FROM --platform=$BUILDPLATFORM busybox:latest AS base
+	COPY foo /etc/foo
+	RUN cp /etc/foo /etc/bar
+
+	FROM scratch
+	COPY --from=base /etc/bar /bar
+	`)
+	bakefile := []byte(`
+	target "default" {
+	platforms = ["linux/amd64", "linux/arm64"]
+	}
+	`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		fstest.CreateFile("foo", []byte("foo"), 0600),
+	)
+
+	cmd := buildxCmd(sb, withDir(dir), withArgs("bake"), withArgs("--set", fmt.Sprintf("*.output=type=image,name=%s,push=true", target)))
+	out, err := cmd.CombinedOutput()
+
+	if !isMobyWorker(sb) {
+		require.NoError(t, err, string(out))
+
+		desc, provider, err := contentutil.ProviderFromRef(target)
+		require.NoError(t, err)
+		imgs, err := testutil.ReadImages(sb.Context(), provider, desc)
+		require.NoError(t, err)
+
+		img := imgs.Find("linux/amd64")
+		require.NotNil(t, img)
+		img = imgs.Find("linux/arm64")
+		require.NotNil(t, img)
+
+	} else {
+		require.Error(t, err, string(out))
+		require.Contains(t, string(out), "Multi-platform build is not supported")
+	}
+}
+
 func testBakeMultiExporters(t *testing.T, sb integration.Sandbox) {
 	if !isDockerContainerWorker(sb) {
 		t.Skip("only testing with docker-container worker")
@@ -1162,4 +1236,230 @@ target "another" {
 	require.True(t, ok)
 
 	require.Len(t, warnings, 1)
+}
+
+func testBakeCallMetadata(t *testing.T, sb integration.Sandbox) {
+	dockerfile := []byte(`
+frOM busybox as base
+cOpy Dockerfile .
+from scratch
+COPy --from=base \
+  /Dockerfile \
+  /
+	`)
+	bakefile := []byte(`
+target "default" {}
+`)
+	dir := tmpdir(
+		t,
+		fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	cmd := buildxCmd(
+		sb,
+		withDir(dir),
+		withArgs("bake", "--call", "check,format=json", "--metadata-file", filepath.Join(dir, "md.json")),
+	)
+	stdout := bytes.Buffer{}
+	stderr := bytes.Buffer{}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+
+	var res map[string]any
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &res), stdout.String())
+	targets, ok := res["target"].(map[string]any)
+	require.True(t, ok)
+	def, ok := targets["default"].(map[string]any)
+	require.True(t, ok)
+	_, ok = def["build"]
+	require.True(t, ok)
+	check, ok := def["check"].(map[string]any)
+	require.True(t, ok)
+	warnings, ok := check["warnings"].([]any)
+	require.True(t, ok)
+	require.Len(t, warnings, 3)
+
+	dt, err := os.ReadFile(filepath.Join(dir, "md.json"))
+	require.NoError(t, err)
+
+	type mdT struct {
+		Default struct {
+			BuildRef   string           `json:"buildx.build.ref"`
+			ResultJSON lint.LintResults `json:"result.json"`
+		} `json:"default"`
+	}
+	var md mdT
+	require.NoError(t, json.Unmarshal(dt, &md), dt)
+	require.Empty(t, md.Default.BuildRef)
+	require.Len(t, md.Default.ResultJSON.Warnings, 3)
+}
+
+func testBakeCheckCallOutput(t *testing.T, sb integration.Sandbox) {
+	t.Run("check for warning count msg in check without warnings", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox
+COPY Dockerfile .
+		`)
+		bakefile := []byte(`
+	target "default" {}
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(
+			sb,
+			withDir(dir),
+			withArgs("bake", "--call", "check"),
+		)
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.NoError(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, no warnings found.")
+	})
+	t.Run("check for warning count msg in check with single warning", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox
+copy Dockerfile .
+		`)
+		bakefile := []byte(`
+	target "default" {}
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(
+			sb,
+			withDir(dir),
+			withArgs("bake", "--call", "check"),
+		)
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, 1 warning has been found!")
+	})
+	t.Run("check for warning count msg in check with multiple warnings", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox
+copy Dockerfile .
+
+FROM busybox as base
+COPY Dockerfile .
+		`)
+		bakefile := []byte(`
+	target "default" {}
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+		)
+
+		cmd := buildxCmd(
+			sb,
+			withDir(dir),
+			withArgs("bake", "--call", "check"),
+		)
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, 2 warnings have been found!")
+	})
+	t.Run("check for warnings with multiple build targets", func(t *testing.T) {
+		dockerfile1 := []byte(`
+FROM busybox
+copy Dockerfile .
+		`)
+		dockerfile2 := []byte(`
+FROM busybox
+copy Dockerfile .
+
+FROM busybox as base
+COPY Dockerfile .
+		`)
+		bakefile := []byte(`
+target "first" {
+	dockerfile = "Dockerfile.first"
+}
+target "second" {
+	dockerfile = "Dockerfile.second"
+}
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+			fstest.CreateFile("Dockerfile.first", dockerfile1, 0600),
+			fstest.CreateFile("Dockerfile.second", dockerfile2, 0600),
+		)
+
+		cmd := buildxCmd(
+			sb,
+			withDir(dir),
+			withArgs("bake", "--call", "check", "first", "second"),
+		)
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), "Check complete, 1 warning has been found!")
+		require.Contains(t, stdout.String(), "Check complete, 2 warnings have been found!")
+	})
+	t.Run("check for Dockerfile path printed with context when displaying rule check warnings with multiple build targets", func(t *testing.T) {
+		dockerfile := []byte(`
+FROM busybox
+copy Dockerfile .
+		`)
+		bakefile := []byte(`
+target "first" {
+	dockerfile = "Dockerfile"
+}
+target "second" {
+	dockerfile = "subdir/Dockerfile"
+}
+target "third" {
+	dockerfile = "subdir/subsubdir/Dockerfile"
+}
+	`)
+		dir := tmpdir(
+			t,
+			fstest.CreateDir("subdir", 0700),
+			fstest.CreateDir("subdir/subsubdir", 0700),
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("subdir/Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("subdir/subsubdir/Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("docker-bake.hcl", bakefile, 0600),
+		)
+
+		dockerfilePathFirst := filepath.Join("Dockerfile")
+		dockerfilePathSecond := filepath.Join("subdir", "Dockerfile")
+		dockerfilePathThird := filepath.Join("subdir", "subsubdir", "Dockerfile")
+
+		cmd := buildxCmd(
+			sb,
+			withDir(dir),
+			withArgs("bake", "--call", "check", "first", "second", "third"),
+		)
+		stdout := bytes.Buffer{}
+		stderr := bytes.Buffer{}
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		require.Error(t, cmd.Run(), stdout.String(), stderr.String())
+		require.Contains(t, stdout.String(), dockerfilePathFirst+":3")
+		require.Contains(t, stdout.String(), dockerfilePathSecond+":3")
+		require.Contains(t, stdout.String(), dockerfilePathThird+":3")
+	})
 }

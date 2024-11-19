@@ -15,9 +15,11 @@ Build from a file
 
 | Name                                | Type          | Default | Description                                                                                         |
 |:------------------------------------|:--------------|:--------|:----------------------------------------------------------------------------------------------------|
+| `--allow`                           | `stringArray` |         | Allow build to access specified resources                                                           |
 | [`--builder`](#builder)             | `string`      |         | Override the configured builder instance                                                            |
 | [`--call`](#call)                   | `string`      | `build` | Set method for evaluating build (`check`, `outline`, `targets`)                                     |
 | [`--check`](#check)                 | `bool`        |         | Shorthand for `--call=check`                                                                        |
+| `-D`, `--debug`                     | `bool`        |         | Enable debug logging                                                                                |
 | [`-f`](#file), [`--file`](#file)    | `stringArray` |         | Build definition file                                                                               |
 | `--load`                            | `bool`        |         | Shorthand for `--set=*.output=type=docker`                                                          |
 | [`--metadata-file`](#metadata-file) | `string`      |         | Write build result metadata to a file                                                               |
@@ -41,8 +43,7 @@ as part of the build.
 Read [High-level build options with Bake](https://docs.docker.com/build/bake/)
 guide for introduction to writing bake files.
 
-> **Note**
->
+> [!NOTE]
 > `buildx bake` command may receive backwards incompatible features in the future
 > if needed. We are looking for feedback on improving the command and extending
 > the functionality further.
@@ -163,17 +164,15 @@ $ cat metadata.json
 }
 ```
 
-> **Note**
->
-> Build record [provenance](https://docs.docker.com/build/attestations/slsa-provenance/#provenance-attestation-example)
+> [!NOTE]
+> Build record [provenance](https://docs.docker.com/build/metadata/attestations/slsa-provenance/#provenance-attestation-example)
 > (`buildx.build.provenance`) includes minimal provenance by default. Set the
 > `BUILDX_METADATA_PROVENANCE` environment variable to customize this behavior:
 > * `min` sets minimal provenance (default).
 > * `max` sets full provenance.
 > * `disabled`, `false` or `0` does not set any provenance.
 
-> **Note**
-> 
+> [!NOTE]
 > Build warnings (`buildx.build.warnings`) are not included by default. Set the
 > `BUILDX_METADATA_WARNINGS` environment variable to `1` or `true` to
 > include them.

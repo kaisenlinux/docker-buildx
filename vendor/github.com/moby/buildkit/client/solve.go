@@ -7,7 +7,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -120,7 +119,7 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 		if opt.SessionPreInitialized {
 			return nil, errors.Errorf("no session provided for preinitialized option")
 		}
-		s, err = session.NewSession(statusContext, defaultSessionName(), opt.SharedKey)
+		s, err = session.NewSession(statusContext, opt.SharedKey)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create session")
 		}
@@ -277,8 +276,8 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 			Frontend:                opt.Frontend,
 			FrontendAttrs:           frontendAttrs,
 			FrontendInputs:          frontendInputs,
-			Cache:                   cacheOpt.options,
-			Entitlements:            opt.AllowedEntitlements,
+			Cache:                   &cacheOpt.options,
+			Entitlements:            entitlementsToPB(opt.AllowedEntitlements),
 			Internal:                opt.Internal,
 			SourcePolicy:            opt.SourcePolicy,
 		})
@@ -395,7 +394,7 @@ func prepareSyncedFiles(def *llb.Definition, localMounts map[string]fsutil.FS) (
 	} else {
 		for _, dt := range def.Def {
 			var op pb.Op
-			if err := (&op).Unmarshal(dt); err != nil {
+			if err := op.UnmarshalVT(dt); err != nil {
 				return nil, errors.Wrap(err, "failed to parse llb proto op")
 			}
 			if src := op.GetSource(); src != nil {
@@ -417,14 +416,6 @@ func prepareSyncedFiles(def *llb.Definition, localMounts map[string]fsutil.FS) (
 		}
 	}
 	return result, nil
-}
-
-func defaultSessionName() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		return "unknown"
-	}
-	return filepath.Base(wd)
 }
 
 type cacheOptions struct {
@@ -557,4 +548,12 @@ func prepareMounts(opt *SolveOpt) (map[string]fsutil.FS, error) {
 		mounts[k] = mount
 	}
 	return mounts, nil
+}
+
+func entitlementsToPB(entitlements []entitlements.Entitlement) []string {
+	clone := make([]string, len(entitlements))
+	for i, e := range entitlements {
+		clone[i] = string(e)
+	}
+	return clone
 }
