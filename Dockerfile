@@ -1,20 +1,23 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.22
-ARG XX_VERSION=1.5.0
+ARG GO_VERSION=1.23
+ARG XX_VERSION=1.6.1
 
 # for testing
-ARG DOCKER_VERSION=27.2.1
+ARG DOCKER_VERSION=27.4.0-rc.2
+ARG DOCKER_VERSION_ALT_26=26.1.3
 ARG DOCKER_CLI_VERSION=${DOCKER_VERSION}
-ARG GOTESTSUM_VERSION=v1.9.0
-ARG REGISTRY_VERSION=2.8.0
-ARG BUILDKIT_VERSION=v0.16.0
-ARG UNDOCK_VERSION=0.7.0
+ARG GOTESTSUM_VERSION=v1.12.0
+ARG REGISTRY_VERSION=2.8.3
+ARG BUILDKIT_VERSION=v0.17.2
+ARG UNDOCK_VERSION=0.8.0
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS golatest
 FROM moby/moby-bin:$DOCKER_VERSION AS docker-engine
 FROM dockereng/cli-bin:$DOCKER_CLI_VERSION AS docker-cli
+FROM moby/moby-bin:$DOCKER_VERSION_ALT_26 AS docker-engine-alt
+FROM dockereng/cli-bin:$DOCKER_VERSION_ALT_26 AS docker-cli-alt
 FROM registry:$REGISTRY_VERSION AS registry
 FROM moby/buildkit:$BUILDKIT_VERSION AS buildkit
 FROM crazymax/undock:$UNDOCK_VERSION AS undock
@@ -77,6 +80,7 @@ RUN --mount=type=bind,target=. \
   set -e
   xx-go --wrap
   DESTDIR=/usr/bin VERSION=$(cat /buildx-version/version) REVISION=$(cat /buildx-version/revision) GO_EXTRA_LDFLAGS="-s -w" ./hack/build
+  file /usr/bin/docker-buildx
   xx-verify --static /usr/bin/docker-buildx
 EOT
 
@@ -95,7 +99,9 @@ FROM scratch AS binaries-unix
 COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx
 
 FROM binaries-unix AS binaries-darwin
+FROM binaries-unix AS binaries-freebsd
 FROM binaries-unix AS binaries-linux
+FROM binaries-unix AS binaries-openbsd
 
 FROM scratch AS binaries-windows
 COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx.exe
@@ -120,10 +126,13 @@ COPY --link --from=gotestsum /out /usr/bin/
 COPY --link --from=registry /bin/registry /usr/bin/
 COPY --link --from=docker-engine / /usr/bin/
 COPY --link --from=docker-cli / /usr/bin/
+COPY --link --from=docker-engine-alt / /opt/docker-alt-26/
+COPY --link --from=docker-cli-alt / /opt/docker-alt-26/
 COPY --link --from=buildkit /usr/bin/buildkitd /usr/bin/
 COPY --link --from=buildkit /usr/bin/buildctl /usr/bin/
 COPY --link --from=undock /usr/local/bin/undock /usr/bin/
 COPY --link --from=binaries /buildx /usr/bin/
+ENV TEST_DOCKER_EXTRA="docker@26.1=/opt/docker-alt-26"
 
 FROM integration-test-base AS integration-test
 COPY . .

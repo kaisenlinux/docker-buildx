@@ -19,6 +19,9 @@ func ParseExports(inp []string) ([]*controllerapi.ExportEntry, error) {
 		return nil, nil
 	}
 	for _, s := range inp {
+		if s == "" {
+			continue
+		}
 		fields, err := csvvalue.Fields(s, nil)
 		if err != nil {
 			return nil, err
@@ -138,7 +141,6 @@ func ParseAnnotations(inp []string) (map[exptypes.AnnotationKey]string, error) {
 			}
 			annotations[ak] = v
 		}
-
 	}
 	return annotations, nil
 }

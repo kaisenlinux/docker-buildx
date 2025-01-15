@@ -325,8 +325,8 @@ func runBuild(ctx context.Context, dockerCli command.Cli, options buildOptions) 
 	}
 	attributes := buildMetricAttributes(dockerCli, driverType, &options)
 
-	ctx2, cancel := context.WithCancel(context.TODO())
-	defer cancel()
+	ctx2, cancel := context.WithCancelCause(context.TODO())
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 	progressMode, err := options.toDisplayMode()
 	if err != nil {
 		return err
@@ -763,8 +763,11 @@ func decodeExporterResponse(exporterResponse map[string]string) map[string]inter
 		}
 		var raw map[string]interface{}
 		if err = json.Unmarshal(dt, &raw); err != nil || len(raw) == 0 {
-			out[k] = v
-			continue
+			var rawList []map[string]interface{}
+			if err = json.Unmarshal(dt, &rawList); err != nil || len(rawList) == 0 {
+				out[k] = v
+				continue
+			}
 		}
 		out[k] = json.RawMessage(dt)
 	}
@@ -882,7 +885,6 @@ func printWarnings(w io.Writer, warnings []client.VertexWarning, mode progressui
 			src.Print(w)
 		}
 		fmt.Fprintf(w, "\n")
-
 	}
 }
 

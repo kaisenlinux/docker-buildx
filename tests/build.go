@@ -471,7 +471,7 @@ RUN echo foo > /bar`)
 	cmd := buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
-	require.False(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("build details link not expected in output, got %q", out))
+	require.False(t, buildDetailsPattern.MatchString(string(out)), "build details link not expected in output, got %q", out)
 
 	// create desktop-build .lastaccess file
 	home, err := os.UserHomeDir() // TODO: sandbox should create a temp home dir and expose it through its interface
@@ -491,7 +491,7 @@ RUN echo foo > /bar`)
 	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err = cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
-	require.True(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("expected build details link in output, got %q", out))
+	require.True(t, buildDetailsPattern.MatchString(string(out)), "expected build details link in output, got %q", out)
 
 	// build erroneous dockerfile
 	dockerfile = []byte(`FROM busybox:latest
@@ -500,12 +500,12 @@ RUN exit 1`)
 	cmd = buildxCmd(sb, withArgs("build", "--output=type=cacheonly", dir))
 	out, err = cmd.CombinedOutput()
 	require.Error(t, err, string(out))
-	require.True(t, buildDetailsPattern.MatchString(string(out)), fmt.Sprintf("expected build details link in output, got %q", out))
+	require.True(t, buildDetailsPattern.MatchString(string(out)), "expected build details link in output, got %q", out)
 }
 
 func testBuildProgress(t *testing.T, sb integration.Sandbox) {
 	dir := createTestProject(t)
-	sbDriver, _ := driverName(sb.Name())
+	sbDriver, _, _ := driverName(sb.Name())
 	name := sb.Address()
 
 	// progress=tty
@@ -578,7 +578,7 @@ func testBuildBuildArgNoKey(t *testing.T, sb integration.Sandbox) {
 	cmd := buildxCmd(sb, withArgs("build", "--build-arg", "=TEST_STRING", dir))
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err, string(out))
-	require.Equal(t, strings.TrimSpace(string(out)), `ERROR: invalid key-value pair "=TEST_STRING": empty key`)
+	require.Equal(t, `ERROR: invalid key-value pair "=TEST_STRING": empty key`, strings.TrimSpace(string(out)))
 }
 
 func testBuildLabelNoKey(t *testing.T, sb integration.Sandbox) {
@@ -586,7 +586,7 @@ func testBuildLabelNoKey(t *testing.T, sb integration.Sandbox) {
 	cmd := buildxCmd(sb, withArgs("build", "--label", "=TEST_STRING", dir))
 	out, err := cmd.CombinedOutput()
 	require.Error(t, err, string(out))
-	require.Equal(t, strings.TrimSpace(string(out)), `ERROR: invalid key-value pair "=TEST_STRING": empty key`)
+	require.Equal(t, `ERROR: invalid key-value pair "=TEST_STRING": empty key`, strings.TrimSpace(string(out)))
 }
 
 func testBuildCacheExportNotSupported(t *testing.T, sb integration.Sandbox) {
@@ -649,7 +649,6 @@ func testBuildMultiPlatform(t *testing.T, sb integration.Sandbox) {
 		require.NotNil(t, img)
 		img = imgs.Find("linux/arm64")
 		require.NotNil(t, img)
-
 	} else {
 		require.Error(t, err, string(out))
 		require.Contains(t, string(out), "Multi-platform build is not supported")

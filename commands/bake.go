@@ -107,9 +107,16 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	if err != nil {
 		return err
 	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return errors.Wrapf(err, "failed to get current working directory")
+	}
+	// filesystem access under the current working directory is allowed by default
+	ent.FSRead = append(ent.FSRead, wd)
+	ent.FSWrite = append(ent.FSWrite, wd)
 
-	ctx2, cancel := context.WithCancel(context.TODO())
-	defer cancel()
+	ctx2, cancel := context.WithCancelCause(context.TODO())
+	defer cancel(errors.WithStack(context.Canceled))
 
 	var nodes []builder.Node
 	var progressConsoleDesc, progressTextDesc string
@@ -192,7 +199,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		}
 	}
 
-	tgts, grps, err := bake.ReadTargets(ctx, files, targets, overrides, defaults)
+	tgts, grps, err := bake.ReadTargets(ctx, files, targets, overrides, defaults, &ent)
 	if err != nil {
 		return err
 	}
@@ -250,7 +257,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	if err != nil {
 		return err
 	}
-	if err := exp.Prompt(ctx, &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
+	if err := exp.Prompt(ctx, url != "", &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
 		return err
 	}
 	if printer.IsDone() {
